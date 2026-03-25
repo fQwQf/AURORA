@@ -1,18 +1,18 @@
-exp_name: "SVHN_alpha0.05"
+exp_name: "CIFAR100_alpha0.05"
 dataset:
-  data_name: "SVHN" # choice: [CIFAR10, CIFAR100, MNIST, FMNIST]
-  root_path: "~/datasets/"
-  # root_path: '/data1/tongjizhou/datasets'
-  train_batch_size: 256
+  data_name: "CIFAR100" # choice: [CIFAR10, CIFAR100, MNIST, FMNIST]
+  # root_path: "/data0/wxy_data/datasets/"
+  root_path: 'H:/codes/dataset'
+  train_batch_size: 512
   test_batch_size: 256
   channels: 3
-  num_classes: 10
+  num_classes: 100
   image_size: 32 # [CIFAR: 32, MNIST: 28]
 
-  aux_data_name: "SVHN"
-  aux_root_path: "~/datasets/"
+  # aux_data_name: "CIFAR10"
+  # aux_root_path: "/data0/wxy_data/datasets/"
   # aux_root_path: "H:/codes/dataset"
-  aux_split: 'test'
+  # aux_split: 'test'
 
 distribution:
   type: "dirichlet" # choice: [iid, noniid, dirichlet]
@@ -23,24 +23,24 @@ client:
   num_clients: 5
 
 server:
-  num_rounds: 50
+  num_rounds: 10
   frac_clients: 1.0
   lr: 0.05
-  local_epochs: 1
+  local_epochs: 10
   optimizer: "sgd" # choice: [sgd, adam]
   momentum: 0.9
   weight_decay: 0.0001
   loss_name: "ce" # choice: [ce, mse, nll]
-  model_name: "resnet18"
+  model_name: "resnet18" # choice: [resnet18, mobilenetv2]
   aggregated_by_datasize: True
   lr_decay_per_round: 0.998
 
 device: "cuda:0"
 
 checkpoint:
-  save_path: "./checkpoints/"
+  save_path: "./checkpoints/neurips/"
   save_freq: 5
-  result_file: "SVHN_results.yaml"
+  result_file: "CIFAR10_results.yaml"
 
 pretrain:
   lr: 0.01
@@ -74,13 +74,13 @@ etf:
 
 visualization:
   interval: 5
-  save_path: 'visualization/resnet18'
+  save_path: "./checkpoints/neurips/"
   vis_size: 16
 resume: True
 resume_best: False
-seed: 350234
+seed: 42
 
-lambda_align_initial: 10.0
+lambda_align_initial: 20.0
 
 v9_config:
   use_adaptive_lambda: true

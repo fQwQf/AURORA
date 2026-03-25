@@ -1,47 +1,35 @@
-exp_name: "SVHN_alpha0.05"
+exp_name: "CIFAR100_alpha0.3_ablation"
 dataset:
-  data_name: "SVHN" # choice: [CIFAR10, CIFAR100, MNIST, FMNIST]
-  root_path: "~/datasets/"
-  # root_path: '/data1/tongjizhou/datasets'
-  train_batch_size: 256
+  data_name: "CIFAR100"
+  root_path: 'H:/codes/dataset'
+  train_batch_size: 512
   test_batch_size: 256
   channels: 3
-  num_classes: 10
-  image_size: 32 # [CIFAR: 32, MNIST: 28]
-
-  aux_data_name: "SVHN"
-  aux_root_path: "~/datasets/"
-  # aux_root_path: "H:/codes/dataset"
-  aux_split: 'test'
-
+  num_classes: 100
+  image_size: 32
 distribution:
-  type: "dirichlet" # choice: [iid, noniid, dirichlet]
-  label_num_per_client: 2 # non-iid parameter
-  alpha: 0.05 # dirichlet distribution parameter
-
+  type: "dirichlet"
+  label_num_per_client: 2
+  alpha: 0.3
 client:
   num_clients: 5
-
 server:
-  num_rounds: 50
+  num_rounds: 10
   frac_clients: 1.0
   lr: 0.05
-  local_epochs: 1
-  optimizer: "sgd" # choice: [sgd, adam]
+  local_epochs: 10
+  optimizer: "sgd"
   momentum: 0.9
   weight_decay: 0.0001
-  loss_name: "ce" # choice: [ce, mse, nll]
+  loss_name: "ce"
   model_name: "resnet18"
   aggregated_by_datasize: True
   lr_decay_per_round: 0.998
-
 device: "cuda:0"
-
 checkpoint:
-  save_path: "./checkpoints/"
+  save_path: "./checkpoints/neurips_ablation/"
   save_freq: 5
-  result_file: "SVHN_results.yaml"
-
+  result_file: "ablation_results.yaml"
 pretrain:
   lr: 0.01
   epoch: 70
@@ -50,7 +38,6 @@ pretrain:
   weight_decay: 0.0001
   model_name: "resnet18"
   model_file_name: "resnet18-f37072fd.pth"
-
 DBCD:
   alpha_l_pa: 1
   alpha_l_pb: 1
@@ -68,30 +55,24 @@ DBCD:
   supcon_temp: 0.07
   super_gr: 100
   aux_with_public: True
-
 etf:
-  loss_name: "ce" # choice: [ce, balanced]
-
+  loss_name: "ce"
 visualization:
   interval: 5
   save_path: 'visualization/resnet18'
   vis_size: 16
-resume: True
+resume: False
 resume_best: False
-seed: 350234
-
-lambda_align_initial: 10.0
-
+seed: 42
+lambda_align_initial: 20.0
 v9_config:
   use_adaptive_lambda: true
   lambda_min: 0.1
   lambda_max: 20.0
-
   use_server_optimization: false
   server_lr: 0.001
   server_epochs: 20
   gamma_etf_reg: 0.1
-
 v10_config:
   use_uncertainty_weighting: true
   sigma_lr: 0.005

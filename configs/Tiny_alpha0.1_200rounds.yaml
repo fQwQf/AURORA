@@ -2,7 +2,7 @@ exp_name: "Tiny_alpha0.1"
 dataset:
   data_name: "Tiny-ImageNet" # choice: [CIFAR10, CIFAR100, MNIST, FMNIST, Tiny-ImageNet]
   root_path: "~/datasets/"
-  # root_path: 'H:/codes/dataset'
+  # root_path: '/data1/tongjizhou/datasets'
   train_batch_size: 256
   test_batch_size: 256
   channels: 3

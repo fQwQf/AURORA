@@ -2,7 +2,7 @@ exp_name: "SVHN_alpha0.05"
 dataset:
   data_name: "SVHN" # choice: [CIFAR10, CIFAR100, MNIST, FMNIST]
   root_path: "~/datasets/"
-  # root_path: 'H:/codes/dataset'
+  # root_path: '/data1/tongjizhou/datasets'
   train_batch_size: 256
   test_batch_size: 256
   channels: 3
