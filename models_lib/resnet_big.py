@@ -189,10 +189,10 @@ class SupConResNet(nn.Module):
 
 class SupCEResNet(nn.Module):
     """encoder + classifier"""
-    def __init__(self, name='resnet50', num_classes=10):
+    def __init__(self, name='resnet50', num_classes=10, in_channel=3):
         super(SupCEResNet, self).__init__()
         model_fun, dim_in = model_dict[name]
-        self.encoder = model_fun()
+        self.encoder = model_fun(in_channel=in_channel)
         self.fc = nn.Linear(dim_in, num_classes)
 
     def forward(self, x):
@@ -256,10 +256,10 @@ class Proto_Classifier(nn.Module):
    
 class ETFCEResNet(nn.Module):
     """encoder + classifier"""
-    def __init__(self, name='resnet50', num_classes=10):
+    def __init__(self, name='resnet50', num_classes=10, in_channel=3):
         super(ETFCEResNet, self).__init__()
         model_fun, dim_in = model_dict[name]
-        self.encoder = model_fun()
+        self.encoder = model_fun(in_channel=in_channel)
         self.fc = nn.Linear(dim_in, num_classes)
         
         self.linear_proto = nn.Linear(dim_in, num_classes)
@@ -283,10 +283,10 @@ class ETFCEResNet(nn.Module):
     
 class LearnableProtoResNet(nn.Module):
     """encoder + classifier"""
-    def __init__(self, name='resnet50', num_classes=10):
+    def __init__(self, name='resnet50', num_classes=10, in_channel=3):
         super(LearnableProtoResNet, self).__init__()
         model_fun, dim_in = model_dict[name]
-        self.encoder = model_fun()
+        self.encoder = model_fun(in_channel=in_channel)
         
         self.learnable_proto = torch.nn.Parameter(torch.randn(num_classes, dim_in))
 
@@ -309,6 +309,36 @@ class LearnableProtoResNet(nn.Module):
             return weight.view(-1, 1).to(exec_device) * self.learnable_proto
         else:
             return self.learnable_proto
+
+class DualHeadProtoResNet(nn.Module):
+    """encoder + linear classification head + learnable prototypes for alignment.
+
+    Decouples classification (unconstrained linear head) from federated
+    alignment (cosine-similarity prototypes).  The linear head provides
+    full capacity for local CE training while prototypes enable
+    cross-client representation alignment via contrastive / ETF losses.
+    """
+    def __init__(self, name='resnet50', num_classes=10, in_channel=3):
+        super(DualHeadProtoResNet, self).__init__()
+        model_fun, dim_in = model_dict[name]
+        self.encoder = model_fun(in_channel=in_channel)
+        self.fc = nn.Linear(dim_in, num_classes)
+        self.learnable_proto = torch.nn.Parameter(torch.randn(num_classes, dim_in))
+
+    def forward(self, x):
+        feature = self.encoder(x)
+        feature_norm = torch.nn.functional.normalize(feature, p=2, dim=1, eps=1e-12)
+        logits = self.fc(feature)
+        return logits, feature_norm
+
+    def get_proto(self, weight=None):
+        if weight is not None:
+            assert len(weight.shape) == 1 and weight.shape[0] == self.learnable_proto.shape[0]
+            exec_device = self.learnable_proto.device
+            return weight.view(-1, 1).to(exec_device) * self.learnable_proto
+        else:
+            return self.learnable_proto
+
 
 class LearnableProtoResNetWithProjector(nn.Module):
     """

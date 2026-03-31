@@ -23,15 +23,28 @@ def save_perf_records(save_path, save_file_name, data_dict, save_mode='w'):
             w.writerow(header)
         w.writerows(zip(*data_dict.values()))
 
-def save_best_local_model(save_path, model, save_name):
+def save_best_local_model(save_path, model, save_name, keep_only_last=False):
 
     if save_path is None:
         logger.warning(f"save_best_local_model called with save_path=None for {save_name}; skipping save.")
         return
 
     os.makedirs(save_path, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(save_path, save_name))
-    logger.info(f"Save the model in {os.path.join(save_path, save_name)}")
+    save_path_full = os.path.join(save_path, save_name)
+    
+    # If keep_only_last is True, remove previous checkpoints to save disk space
+    if keep_only_last:
+        # Remove previous epoch checkpoints in the same directory
+        for f in os.listdir(save_path):
+            if f.startswith('epoch_') and f.endswith('.pth'):
+                try:
+                    os.remove(os.path.join(save_path, f))
+                    logger.debug(f"Removed old checkpoint: {f}")
+                except OSError:
+                    pass
+    
+    torch.save(model.state_dict(), save_path_full)
+    logger.info(f"Save the model in {save_path_full}")
 
 def load_best_local_model(save_path, save_name):
     best_model = torch.load(os.path.join(save_path, save_name), map_location='cpu')
@@ -226,7 +239,7 @@ def local_training(model, training_data, test_dataloader,
             #                 best_acc=best_acc, 
             #                 best_round=best_epoch, 
             #                 acc_list=history_acc_list)
-            save_best_local_model(client_model_dir, model, f'epoch_{e}.pth')
+            save_best_local_model(client_model_dir, model, f'epoch_{e}.pth', keep_only_last=True)
 
     return model
 

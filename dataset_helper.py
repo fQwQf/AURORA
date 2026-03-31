@@ -15,6 +15,7 @@ NORMALIZE_DICT = {
     'Tiny-ImageNet': dict(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
     'SVHN': dict(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)), 
     'EMNIST_digits': dict(mean=(0.5,), std=(0.5,)),
+    'FEMNIST': dict(mean=(0.5,), std=(0.5,)),
     'PathMNIST': dict(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
 }
 
@@ -146,6 +147,22 @@ def load_dataset(dataset_name, data_path, normalize_train=True, normalize_test=T
         train_dataset = PathMNIST(root=data_path, split='train', download=True, transform=train_transform, target_transform=target_transform)
         test_dataset = PathMNIST(root=data_path, split='test', download=True, transform=test_transform, target_transform=target_transform)
 
+    elif dataset_name == 'FEMNIST':
+        train_transform_list = [transforms.ToTensor()]
+        if normalize_train:
+            train_transform_list.append(transforms.Normalize(**NORMALIZE_DICT[dataset_name]))
+        train_transform = transforms.Compose(train_transform_list)
+
+        test_transform_list = [transforms.ToTensor()]
+        if normalize_test:
+            test_transform_list.append(transforms.Normalize(**NORMALIZE_DICT[dataset_name]))
+        test_transform = transforms.Compose(test_transform_list)
+
+        emnist_train = torchvision.datasets.EMNIST(root=data_path, split='byclass', train=True, transform=train_transform, download=True)
+        emnist_test = torchvision.datasets.EMNIST(root=data_path, split='byclass', train=False, transform=test_transform, download=True)
+        
+        train_dataset = emnist_train
+        test_dataset = emnist_test
 
     else:
         logger.error(f'Dataset {dataset_name} not supported')
@@ -298,7 +315,43 @@ def dirichlet(data_idxs_dict, num_users, alpha):
     return client_idx_map
 
 
-def get_fl_dataset(dataset_name, dataset_path, num_users, distribution, distribution_params=2, alpha=0.1, normalize_train=True, normalize_test=True):
+def natural_partition(dataset, num_users, alpha=0.5, max_samples_per_client=None):
+    total_samples = len(dataset)
+    client_idx_map = defaultdict(list)
+    class_to_idxs = defaultdict(list)
+    for idx in range(total_samples):
+        _, label = dataset[idx]
+        if hasattr(label, 'item'):
+            label = label.item()
+        class_to_idxs[label].append(idx)
+    
+    num_classes = len(class_to_idxs)
+    target_per_client = total_samples // num_users
+    if max_samples_per_client is not None:
+        target_per_client = min(target_per_client, max_samples_per_client)
+    
+    for client_id in range(num_users):
+        class_probs = np.random.dirichlet([alpha] * num_classes)
+        samples_per_class = (class_probs * target_per_client).astype(int)
+        
+        for class_id, num_samples in enumerate(samples_per_class):
+            if num_samples > 0 and len(class_to_idxs[class_id]) > 0:
+                if num_samples > len(class_to_idxs[class_id]):
+                    sampled_idxs = np.random.choice(class_to_idxs[class_id], num_samples, replace=True)
+                else:
+                    sampled_idxs = np.random.choice(class_to_idxs[class_id], num_samples, replace=False)
+                client_idx_map[client_id].extend(sampled_idxs.tolist())
+        
+        random.shuffle(client_idx_map[client_id])
+    
+    logger.info(f"Natural partition generated for {num_users} clients with alpha={alpha}")
+    if max_samples_per_client is not None:
+        for cid in client_idx_map:
+            logger.info(f"  Client {cid}: {len(client_idx_map[cid])} samples (capped at {max_samples_per_client})")
+    return dict(client_idx_map)
+
+
+def get_fl_dataset(dataset_name, dataset_path, num_users, distribution, distribution_params=2, alpha=0.1, normalize_train=True, normalize_test=True, max_samples_per_client=None):
     train_set, test_set = load_dataset(dataset_name, dataset_path, normalize_train=normalize_train, normalize_test=normalize_test)
     data_idx_dict = build_dataset_idxs(train_set, dataset_name)
 
@@ -308,8 +361,10 @@ def get_fl_dataset(dataset_name, dataset_path, num_users, distribution, distribu
         client_idx_map = non_iid(data_idx_dict, num_users, distribution_params)
     elif distribution == 'dirichlet':
         client_idx_map = dirichlet(data_idx_dict, num_users, alpha)
+    elif distribution == 'natural':
+        client_idx_map = natural_partition(train_set, num_users, alpha, max_samples_per_client=max_samples_per_client)
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Distribution type '{distribution}' not supported")
     
     return train_set, test_set, client_idx_map
 

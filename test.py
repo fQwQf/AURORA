@@ -28,7 +28,8 @@ trainset, testset, client_idx_map = get_fl_dataset(
     config['distribution']['label_num_per_client'], 
     config['distribution']['alpha'],
     normalize_train=normalize_train,
-    normalize_test=normalize_test)
+    normalize_test=normalize_test,
+    max_samples_per_client=config['distribution'].get('max_samples_per_client', None))
 
 test_loader = torch.utils.data.DataLoader(testset, batch_size=config['dataset']['test_batch_size'], shuffle=True)
 
@@ -104,11 +105,15 @@ elif config_args.algo == 'AURORAFedAvg':
 elif config_args.algo == 'OursV15':
     OneshotOursV15(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
 elif config_args.algo == 'OursV15FedAvg':
-    # Since OursV15 implementation already does FedAvg at the end if we just run it, 
-    # we can point to the same function or if I want to strictly only run FedAvg there should be a separate function.
-    # But based on my implementation, OursV15 does the full training + FedAvg.
-    # If the user specifically asks for V15FedAvg, it implies the same.
     OneshotOursV15(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
+elif config_args.algo == 'OursV16':
+    OneshotOursV16(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
+elif config_args.algo == 'OursV17':
+    OneshotOursV17(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
+elif config_args.algo == 'OursV18':
+    OneshotOursV18(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
+elif config_args.algo == 'OursV19':
+    OneshotOursV19(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
 elif config_args.algo == 'Ours_FeatureCollapse_Ablation':
     OneshotOurs_FeatureCollapse_Ablation(trainset, test_loader, client_idx_map, config, device, lambda_val=config_args.lambdaval)
 else:

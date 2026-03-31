@@ -4,6 +4,8 @@ from .lightweight_model import *
 from .vit import *
 
 def get_train_models(model_name, num_classes, mode, use_pretrain=False, **kwargs):
+    in_channel = kwargs.get('in_channel', 3)
+    
     if mode == 'unsupervised':
         train_model = SupConResNet(model_name, head=kwargs['head'])
         if kwargs['classifier'] == 'linear':
@@ -15,7 +17,7 @@ def get_train_models(model_name, num_classes, mode, use_pretrain=False, **kwargs
         model = get_model_for_ot(model_name, n_c=num_classes)
         return model
     elif mode == 'etf':
-        model = ETFCEResNet(model_name, num_classes=num_classes)
+        model = ETFCEResNet(model_name, num_classes=num_classes, in_channel=in_channel)
         return model
     elif mode == 'our':
         if 'mobilenet' in model_name:
@@ -28,7 +30,7 @@ def get_train_models(model_name, num_classes, mode, use_pretrain=False, **kwargs
                 
             # If use_pretrain is a STRING, we treat it as a path to a checkpoint
             if isinstance(use_pretrain, str):
-                model = LearnableProtoResNet(model_name, num_classes=num_classes)
+                model = LearnableProtoResNet(model_name, num_classes=num_classes, in_channel=in_channel)
                 print(f"[get_train_models] Loading custom weights from {use_pretrain}")
                 state_dict = torch.load(use_pretrain, map_location='cpu')
                 
@@ -56,13 +58,54 @@ def get_train_models(model_name, num_classes, mode, use_pretrain=False, **kwargs
                     model.encoder.load_state_dict(state_dict, strict=False)
                 
             elif use_pretrain:
-                # User explicitly requested NO ImageNet weights.
-                # If we are here, it means use_pretrain is True (bool) but not a string path.
-                # We should NOT load ImageNet.
-                print("[get_train_models] Warning: use_pretrain=True but no path provided. ImageNet weights are DISABLED by user request. Using random initialization.")
-                model = LearnableProtoResNet(model_name, num_classes=num_classes)
+                import torchvision.models as models
+                print("[get_train_models] Loading ImageNet pretrained weights for ResNet-18.")
+                model = LearnableProtoResNet(model_name, num_classes=num_classes, in_channel=in_channel)
+                
+                try:
+                    pretrained_model = models.resnet18(weights='DEFAULT')
+                except:
+                    pretrained_model = models.resnet18(pretrained=True)
+                
+                pretrained_dict = pretrained_model.state_dict()
+                model_dict = model.encoder.state_dict()
+                
+                # Filter: matching keys, compatible shapes, excluding fc layer
+                compatible_dict = {}
+                for k, v in pretrained_dict.items():
+                    if k in model_dict and k not in ['fc.weight', 'fc.bias']:
+                        if v.shape == model_dict[k].shape:
+                            compatible_dict[k] = v
+                        else:
+                            print(f"[get_train_models] Skipping {k}: shape mismatch (pretrain {v.shape} vs model {model_dict[k].shape})")
+                
+                model_dict.update(compatible_dict)
+                model.encoder.load_state_dict(model_dict)
+                
+                print(f"[get_train_models] Loaded {len(compatible_dict)} layers from ImageNet pretrained ResNet-18.")
             else:
-                model = LearnableProtoResNet(model_name, num_classes=num_classes)
+                model = LearnableProtoResNet(model_name, num_classes=num_classes, in_channel=in_channel)
+        return model
+    elif mode == 'our_dual':
+        model = DualHeadProtoResNet(model_name, num_classes=num_classes, in_channel=in_channel)
+        if isinstance(use_pretrain, str):
+            state_dict = torch.load(use_pretrain, map_location='cpu')
+            if any(k.startswith('encoder.') for k in state_dict.keys()):
+                model.load_state_dict(state_dict, strict=False)
+            else:
+                model.encoder.load_state_dict(state_dict, strict=False)
+        elif use_pretrain:
+            import torchvision.models as models
+            pretrained_model = models.resnet18(weights='DEFAULT')
+            pretrained_dict = pretrained_model.state_dict()
+            model_dict = model.encoder.state_dict()
+            compatible_dict = {}
+            for k, v in pretrained_dict.items():
+                if k in model_dict and k not in ['fc.weight', 'fc.bias']:
+                    if v.shape == model_dict[k].shape:
+                        compatible_dict[k] = v
+            model_dict.update(compatible_dict)
+            model.encoder.load_state_dict(model_dict)
         return model
     elif mode == 'our_projector':
         # New mode for V15
@@ -139,9 +182,7 @@ def get_train_models(model_name, num_classes, mode, use_pretrain=False, **kwargs
         if 'mobilenetv2' in model_name:
             model = SupConMobileNet(model_name, feat_dim=num_classes)
         elif model_name == 'vit':
-            # Standard supervised training for ViT (FedAvg)
-            # Use the defaults defined in vit.py (Tiny scale)
             model = SimpleViT(num_classes=num_classes)
         else:
-            model = SupCEResNet(model_name, num_classes=num_classes)
+            model = SupCEResNet(model_name, num_classes=num_classes, in_channel=in_channel)
         return model

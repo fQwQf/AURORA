@@ -62,7 +62,8 @@ def OneshotFedETF(trainset, test_loader, client_idx_map, config, device):
     global_model = get_train_models(
         model_name=config['server']['model_name'],
         num_classes=config['dataset']['num_classes'],
-        mode='etf'
+        mode='etf',
+        in_channel=config['dataset'].get('channels', 3)
     )
 
     global_model.to(device)

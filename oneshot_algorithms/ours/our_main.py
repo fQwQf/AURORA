@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from oneshot_algorithms.ours.our_local_training import ours_local_training
 from oneshot_algorithms.ours.gpu_augmentation import get_gpu_augmentation
+from oneshot_algorithms.ours.unsupervised_loss import SupConLoss, Contrastive_proto_feature_loss, Contrastive_proto_loss
 
 import math
 
@@ -76,7 +77,6 @@ def get_supcon_transform(dataset_name):
                 torchvision.transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
             ], p=0.8),
             torchvision.transforms.RandomGrayscale(p=0.2),
-            # torchvision.transforms.ToTensor(),
             torchvision.transforms.Normalize(**NORMALIZE_DICT[dataset_name])
         ])                
     else:    
@@ -87,7 +87,6 @@ def get_supcon_transform(dataset_name):
             torchvision.transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
         ], p=0.8),
         torchvision.transforms.RandomGrayscale(p=0.2),
-        # torchvision.transforms.ToTensor(),
         torchvision.transforms.Normalize(**NORMALIZE_DICT[dataset_name])
         ])
 
@@ -361,6 +360,41 @@ def eval_with_proto(model, test_loader, device, proto):
     acc = correct / total
     return acc        
 
+
+class WEnsembleDualHead(torch.nn.Module):
+    def __init__(self, model_list, weight_list=None):
+        super(WEnsembleDualHead, self).__init__()
+        self.models = model_list
+        if weight_list is None:
+            self.weight_list = [1.0 / len(model_list) for _ in range(len(model_list))]
+        else:
+            self.weight_list = weight_list
+        avg_fc_weight = sum(w * m.fc.weight.data for w, m in zip(self.weight_list, self.models))
+        avg_fc_bias = sum(w * m.fc.bias.data for w, m in zip(self.weight_list, self.models))
+        self.register_buffer('avg_fc_weight', avg_fc_weight)
+        self.register_buffer('avg_fc_bias', avg_fc_bias)
+
+    def forward(self, x):
+        feature_total = 0
+        for model, weight in zip(self.models, self.weight_list):
+            feature_total += weight * model.encoder(x)
+        return F.linear(feature_total, self.avg_fc_weight, self.avg_fc_bias)
+
+
+def eval_with_linear_head(ensemble, test_loader, device):
+    ensemble.eval()
+    ensemble.to(device)
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+            logits = ensemble(data)
+            _, predicted = torch.max(logits.data, 1)
+            total += target.size(0)
+            correct += (predicted == target).sum().item()
+    return correct / total
+
 def eval_output_ensemble(model, test_loader, device):
     """
     Evaluates an ensemble model that directly outputs class probabilities.
@@ -387,379 +421,23 @@ def eval_output_ensemble(model, test_loader, device):
 
 def OneshotOurs(trainset, test_loader, client_idx_map, config, device, server_strategy='simple_feature'):
     logger.info('OneshotOurs')
-    # get the global model
-    global_model = get_train_models(
-        model_name=config['server']['model_name'],
-        num_classes=config['dataset']['num_classes'],
-        mode='our'
-    )
-
-    global_model.to(device)
-    global_model.train()
-
-    method_results = defaultdict(list)
-    save_path, local_model_dir = prepare_checkpoint_dir(config)
-    # save the config to file
-    if not os.path.exists(save_path + "/config.yaml"):
-        save_yaml_config(save_path + "/config.yaml", config) 
-
-    # all clients perform local training phrase, the global model is used as the initial model
-    local_models = [copy.deepcopy(global_model) for _ in range(config['client']['num_clients'])]
     
-    # get the weight of each client
-    local_data_size = [len(client_idx_map[c]) for c in range(config['client']['num_clients'])]
-    # weight
-    if config['server']['aggregated_by_datasize']:
-        weights = [i/sum(local_data_size) for i in local_data_size]
-    else:
-        weights = [1/config['client']['num_clients'] for _ in range(config['client']['num_clients'])]        
-    
-    aug_transformer = get_gpu_augmentation(config['dataset']['data_name'], device)
-
-    # visualization
-
-    supervised_transformer = get_supervised_transform(config['dataset']['data_name'])
-    vis_loader = torch.utils.data.DataLoader(copy.deepcopy(test_loader.dataset), config['visualization']['vis_size'], shuffle=False)
-    vis_iter = iter(vis_loader)
-    vis_data, vis_label = next(vis_iter)
-    vis_data = supervised_transformer(vis_data)
-    vis_folder = config['visualization']['save_path'] +"/ours/"
-
-    noise_samples = torch.randn_like(vis_data)
-
-    total_rounds = config['server']['num_rounds']
-
-
-    # sample_per_class
-    clients_sample_per_class = []
-
-    for cr in trange(config['server']['num_rounds']):
-        logger.info(f"Round {cr} starts--------|")
-        
-        local_protos = []
-        
-        for c in range(config['client']['num_clients']):
-
-            logger.info(f"Client {c} Starts Local Trainning--------|")
-            client_dataloader = get_client_dataloader(client_idx_map[c], trainset, config['dataset']['train_batch_size'])
-
-            if cr == 0:
-                clients_sample_per_class.append(generate_sample_per_class(config['dataset']['num_classes'], client_dataloader, len(client_idx_map[c])))
-                logger.info('generating sample per sample')
-
-
-            # local training
-            local_model_c = ours_local_training(
-                model=copy.deepcopy(local_models[c]),
-                training_data=client_dataloader,
-                test_dataloader=test_loader,
-                start_epoch=cr * config['server']['local_epochs'],
-                local_epochs=config['server']['local_epochs'],
-                optim_name=config['server']['optimizer'],
-                lr=config['server']['lr'],
-                momentum=config['server']['momentum'],
-                loss_name=config['server']['loss_name'],
-                device=device,
-                num_classes=config['dataset']['num_classes'],
-                sample_per_class=clients_sample_per_class[c],
-                aug_transformer=aug_transformer,
-                client_model_dir=local_model_dir + f"/client_{c}",
-                total_rounds=total_rounds,
-                save_freq=config['checkpoint']['save_freq'],
-            )
-            
-            local_models[c] = local_model_c
-            
-
-            # collecting the local prototypes
-            # local_proto_c = collect_protos(copy.deepcopy(local_model_c), client_dataloader, device)
-            # local_proto_c = local_model_c.get_proto(clients_sample_per_class[c]).detach()
-            local_proto_c = local_model_c.get_proto().detach()
-
-            local_protos.append(local_proto_c)
-
-            # visualize_pic(local_model_c.encoder, vis_data, target_layers=[local_model_c.encoder.layer4], dataset_name=config['dataset']['data_name'], save_file_name=f'{save_path}/{vis_folder}/local_model_{c}.png', device=device)
-                
-            # logger.info(f"Visualization of Global model at {save_path}/{vis_folder}/local_model_{c}.png")
-
-            # evaluate the distance between the noise feature and protos
-
-            
-
-        logger.info(f"Round {cr} Finish--------|")
-        # some statistics of the current local models
-        model_var_m, model_var_s = compute_local_model_variance(local_models)
-        logger.info(f"Model variance: mean: {model_var_m}, sum: {model_var_s}")
-
-
-        global_proto = aggregate_local_protos(local_protos)
-        
-        if server_strategy == 'true_simple_output':
-            method_name = 'OursV4+TrueSimpleOutputServer'
-            ensemble_model = TrueSimpleEnsembleServer(model_list=local_models, weight_list=weights)
-            logger.info("V4 Training | Using TRULY SIMPLE Output-level Server.")
-            ens_acc = eval_output_ensemble(ensemble_model, test_loader, device)
-
-        elif server_strategy == 'simple_feature':
-            method_name = 'OursV4+SimpleFeatureServer'
-            ensemble_model = WEnsembleFeature(model_list=local_models, weight_list=weights)
-            global_proto = aggregate_local_protos(local_protos)
-            logger.info("V4 Training | Using Simple Feature-level Server.")
-            ens_acc = eval_with_proto(ensemble_model, test_loader, device, global_proto)
-
-        elif server_strategy == 'advanced_iffi':
-            method_name = 'OursV4+AdvancedIFFIServer'
-            ensemble_model = WEnsembleFeatureNoise(model_list=local_models, weight_list=weights)
-            global_proto = aggregate_local_protos(local_protos)
-            logger.info("V4 Training | Using Advanced IFFI Server.")
-            ens_acc = eval_with_proto(ensemble_model, test_loader, device, global_proto)
-        else:
-            raise ValueError(f"Unknown server_strategy: {server_strategy}")
-
-        logger.info(f"The test accuracy of {method_name}: {ens_acc}")
-
-
-        method_results[method_name].append(ens_acc)
-
-
-        save_yaml_config(save_path + "/baselines_" + method_name +"_" + config['checkpoint']['result_file'], method_results)
-
-
-# Added OneshotOursV5 (DRCL Version)
-def OneshotOursV5(trainset, test_loader, client_idx_map, config, device, use_simple_server=True):
-    logger.info('OneshotOursV5 with Decoupled Representation and Classifier Learning (DRCL)')
-    # get the global model
-    global_model = get_train_models(
-        model_name=config['server']['model_name'],
-        num_classes=config['dataset']['num_classes'],
-        mode='our'
-    )
-
-    global_model.to(device)
-    global_model.train()
-
-    # --- New Logic: Create fixed global prototype anchors ---
-    # Get prototype dimensions
-    proto_shape = global_model.learnable_proto.shape
-    # Random initialization, set requires_grad=False to make it non-learnable
-    fixed_anchors = torch.randn(proto_shape, device=device, requires_grad=False)
-    # Normalize to ensure stability
-    fixed_anchors = torch.nn.functional.normalize(fixed_anchors, dim=1)
-    logger.info(f"Initialized fixed anchors with shape: {fixed_anchors.shape}")
-    # ----------------------------------------
-
-    method_results = defaultdict(list)
-    save_path, local_model_dir = prepare_checkpoint_dir(config)
-    if not os.path.exists(save_path + "/config.yaml"):
-        save_yaml_config(save_path + "/config.yaml", config) 
-
-    local_models = [copy.deepcopy(global_model) for _ in range(config['client']['num_clients'])]
-    
-    local_data_size = [len(client_idx_map[c]) for c in range(config['client']['num_clients'])]
-    if config['server']['aggregated_by_datasize']:
-        weights = [i/sum(local_data_size) for i in local_data_size]
-    else:
-        weights = [1/config['client']['num_clients'] for _ in range(config['client']['num_clients'])]        
-    
-    aug_transformer = get_gpu_augmentation(config['dataset']['data_name'], device)
-
-    clients_sample_per_class = []
-
-    total_rounds = config['server']['num_rounds']
-
-    for cr in trange(config['server']['num_rounds']):
-        logger.info(f"Round {cr} starts--------|")
-        
-        local_protos = []
-        
-        for c in range(config['client']['num_clients']):
-            logger.info(f"Client {c} Starts Local Trainning--------|")
-            client_dataloader = get_client_dataloader(client_idx_map[c], trainset, config['dataset']['train_batch_size'])
-
-            if cr == 0:
-                clients_sample_per_class.append(generate_sample_per_class(config['dataset']['num_classes'], client_dataloader, len(client_idx_map[c])))
-                logger.info('generating sample per sample')
-
-            # --- Modified local training call ---
-            local_model_c = ours_local_training(
-                model=copy.deepcopy(local_models[c]),
-                training_data=client_dataloader,
-                test_dataloader=test_loader,
-                start_epoch=cr * config['server']['local_epochs'],
-                local_epochs=config['server']['local_epochs'],
-                optim_name=config['server']['optimizer'],
-                lr=config['server']['lr'],
-                momentum=config['server']['momentum'],
-                loss_name=config['server']['loss_name'],
-                device=device,
-                num_classes=config['dataset']['num_classes'],
-                sample_per_class=clients_sample_per_class[c],
-                aug_transformer=aug_transformer,
-                client_model_dir=local_model_dir + f"/client_{c}",
-                total_rounds=total_rounds,
-                save_freq=config['checkpoint']['save_freq'],
-                # Pass new arguments to enable DRCL
-                use_drcl=True,
-                fixed_anchors=fixed_anchors,
-                lambda_align=config.get('lambda_align', 1.0) # Get hyperparameter from config, default 1.0
-            )
-            # --------------------------
-            
-            local_models[c] = local_model_c
-
-            local_proto_c = local_model_c.get_proto().detach()
-            local_protos.append(local_proto_c)
-
-        logger.info(f"Round {cr} Finish--------|")
-        model_var_m, model_var_s = compute_local_model_variance(local_models)
-        logger.info(f"Model variance: mean: {model_var_m}, sum: {model_var_s}")
-
-        global_proto = aggregate_local_protos(local_protos)
-        
-        if use_simple_server:
-            method_name = 'OneShotOursV5+SimpleServer'
-            ensemble_model = WEnsembleFeature(model_list=local_models, weight_list=weights)
-            logger.info("V5 Training | Using SIMPLE server aggregation.")
-        else:
-            method_name = 'OneShotOursV5+AdvancedServer'
-            ensemble_model = WEnsembleFeatureNoise(model_list=local_models, weight_list=weights)
-            logger.info("V5 Training | Using ADVANCED IFFI server aggregation.")
-            
-        ens_proto_acc = eval_with_proto(copy.deepcopy(ensemble_model), test_loader, device, global_proto)
-        logger.info(f"The test accuracy (with prototype) of {method_name}: {ens_proto_acc}")
-        method_results[method_name].append(ens_proto_acc)
-
-        save_yaml_config(save_path + "/baselines_" + method_name +"_" + config['checkpoint']['result_file'], method_results)
-
-# OneshotOursV6 (Lambda Annealing)
-def OneshotOursV6(trainset, test_loader, client_idx_map, config, device, use_simple_server=True):
-    logger.info('OneshotOursV6 with DRCL and Lambda Annealing')
-    # get the global model
-    global_model = get_train_models(
-        model_name=config['server']['model_name'],
-        num_classes=config['dataset']['num_classes'],
-        mode='our'
-    )
-
-    global_model.to(device)
-    global_model.train()
-    
-    proto_shape = global_model.learnable_proto.shape
-    fixed_anchors = torch.randn(proto_shape, device=device, requires_grad=False)
-    fixed_anchors = torch.nn.functional.normalize(fixed_anchors, dim=1)
-    logger.info(f"Initialized fixed anchors with shape: {fixed_anchors.shape}")
-
-    method_results = defaultdict(list)
-    save_path, local_model_dir = prepare_checkpoint_dir(config)
-    if not os.path.exists(save_path + "/config.yaml"):
-        save_yaml_config(save_path + "/config.yaml", config) 
-
-    local_models = [copy.deepcopy(global_model) for _ in range(config['client']['num_clients'])]
-    
-    local_data_size = [len(client_idx_map[c]) for c in range(config['client']['num_clients'])]
-    if config['server']['aggregated_by_datasize']:
-        weights = [i/sum(local_data_size) for i in local_data_size]
-    else:
-        weights = [1/config['client']['num_clients'] for _ in range(config['client']['num_clients'])]        
-    
-    aug_transformer = get_gpu_augmentation(config['dataset']['data_name'], device)
-
-    clients_sample_per_class = []
-
-    total_rounds = config['server']['num_rounds']
-
-    for cr in trange(config['server']['num_rounds']):
-        logger.info(f"Round {cr} starts--------|")
-        
-        local_protos = []
-        
-        for c in range(config['client']['num_clients']):
-            logger.info(f"Client {c} Starts Local Trainning--------|")
-            client_dataloader = get_client_dataloader(client_idx_map[c], trainset, config['dataset']['train_batch_size'])
-
-            if cr == 0:
-                clients_sample_per_class.append(generate_sample_per_class(config['dataset']['num_classes'], client_dataloader, len(client_idx_map[c])))
-                logger.info('generating sample per sample')
-
-            # Calls the same local_training function, but internal logic changes with epochs
-            local_model_c = ours_local_training(
-                model=copy.deepcopy(local_models[c]),
-                training_data=client_dataloader,
-                test_dataloader=test_loader,
-                start_epoch=cr * config['server']['local_epochs'],
-                local_epochs=config['server']['local_epochs'],
-                optim_name=config['server']['optimizer'],
-                lr=config['server']['lr'],
-                momentum=config['server']['momentum'],
-                loss_name=config['server']['loss_name'],
-                device=device,
-                num_classes=config['dataset']['num_classes'],
-                sample_per_class=clients_sample_per_class[c],
-                aug_transformer=aug_transformer,
-                client_model_dir=local_model_dir + f"/client_{c}",
-                total_rounds=total_rounds,
-                save_freq=config['checkpoint']['save_freq'],
-                use_drcl=True,
-                fixed_anchors=fixed_anchors,
-                # lambda_align now represents the initial value
-                lambda_align=config.get('lambda_align_initial', 5.0)
-            )
-            
-            local_models[c] = local_model_c
-
-            local_proto_c = local_model_c.get_proto().detach()
-            local_protos.append(local_proto_c)
-
-        logger.info(f"Round {cr} Finish--------|")
-        model_var_m, model_var_s = compute_local_model_variance(local_models)
-        logger.info(f"Model variance: mean: {model_var_m}, sum: {model_var_s}")
-
-        global_proto = aggregate_local_protos(local_protos)
-        
-        if use_simple_server:
-            method_name = 'OneShotOursV6+SimpleServer'
-            ensemble_model = WEnsembleFeature(model_list=local_models, weight_list=weights)
-            logger.info("V6 Training | Using SIMPLE server aggregation.")
-        else:
-            method_name = 'OneShotOursV6+AdvancedServer'
-            ensemble_model = WEnsembleFeatureNoise(model_list=local_models, weight_list=weights)
-            logger.info("V6 Training | Using ADVANCED IFFI server aggregation.")
-            
-        ens_proto_acc = eval_with_proto(copy.deepcopy(ensemble_model), test_loader, device, global_proto)
-        logger.info(f"The test accuracy (with prototype) of {method_name}: {ens_proto_acc}")
-        method_results[method_name].append(ens_proto_acc)
-
-        save_yaml_config(save_path + "/baselines_" + method_name +"_" + config['checkpoint']['result_file'], method_results)
-
-# OneshotOursV7 (ETF Anchors + Lambda Annealing)
-def OneshotOursV7(trainset, test_loader, client_idx_map, config, device, server_strategy='simple_feature',lambda_val=0):
-    logger.info('OneshotOursV7 with DRCL (ETF Anchors) and Lambda Annealing')
-    
-    use_pretrain_bool = config.get('DBCD', {}).get('use_pretrain', False)
-    custom_pretrain_path = config.get('pretrain', {}).get('model_path', '')
-    dataset_name_lower = config['dataset']['data_name'].lower()
-    model_name = config['server']['model_name']
-    expected_custom_path = os.path.join(custom_pretrain_path, f"{dataset_name_lower}_{model_name}_centralized.pth")
-    
+    use_imagenet_pretrain = config.get('DBCD', {}).get('use_imagenet_pretrain', False)
     use_pretrain_arg = False
-    if use_pretrain_bool:
-        if os.path.exists(expected_custom_path):
-            use_pretrain_arg = expected_custom_path
-            logger.info(f"[OneshotOursV7] Found custom centralized weights at {expected_custom_path}. Using them!")
-        else:
-            use_pretrain_arg = False # Changed from True
-            logger.warning(f"[OneshotOursV7] Custom weights NOT found at {expected_custom_path}. Using Random Initialization (ImageNet Disabled).")
-
+    if use_imagenet_pretrain:
+        use_pretrain_arg = True
+        logger.info("[OneshotOurs] Loading ImageNet pretrained weights for ResNet-18.")
+    
+    # get the global model
     global_model = get_train_models(
         model_name=config['server']['model_name'],
         num_classes=config['dataset']['num_classes'],
         mode='our',
-        use_pretrain=use_pretrain_arg
+        use_pretrain=use_pretrain_arg,
+        in_channel=config['dataset'].get('channels', 3)
     )
     global_model.to(device)
     global_model.train()
-
-    # --- Core modification: Replace random anchors with ETF anchors ---
     feature_dim = global_model.learnable_proto.shape[1]
     num_classes = config['dataset']['num_classes']
     fixed_anchors = generate_etf_anchors(num_classes, feature_dim, device)
@@ -874,7 +552,8 @@ def OneshotOursV8(trainset, test_loader, client_idx_map, config, device):
         model_name=config['server']['model_name'],
         num_classes=config['dataset']['num_classes'],
         mode='our'
-    )
+    ,
+        in_channel=config['dataset'].get('channels', 3))
     global_model.to(device)
     global_model.train()
     
@@ -969,7 +648,8 @@ def OneshotOursV9(trainset, test_loader, client_idx_map, config, device, server_
         model_name=config['server']['model_name'],
         num_classes=config['dataset']['num_classes'],
         mode='our'
-    )
+    ,
+        in_channel=config['dataset'].get('channels', 3))
     global_model.to(device)
     global_model.train()
 
@@ -1147,7 +827,8 @@ def OneshotOursV10(trainset, test_loader, client_idx_map, config, device, **kwar
         model_name=config['server']['model_name'],
         num_classes=config['dataset']['num_classes'],
         mode='our',
-        use_pretrain=use_pretrain_arg
+        use_pretrain=use_pretrain_arg,
+        in_channel=config['dataset'].get('channels', 3)
     )
 
     feature_dim = global_model.learnable_proto.shape[1]
@@ -1298,13 +979,18 @@ def OneshotOursV11(trainset, test_loader, client_idx_map, config, device,anneali
         model_name=config['server']['model_name'],
         num_classes=config['dataset']['num_classes'],
         mode='our',
-        use_pretrain=use_pretrain_arg
+        use_pretrain=use_pretrain_arg,
+        in_channel=config['dataset'].get('channels', 3)
     )
+    global_model.to(device)
+    global_model.train()
     feature_dim = global_model.learnable_proto.shape[1]
     num_classes = config['dataset']['num_classes']
     etf_anchors = generate_etf_anchors(num_classes, feature_dim, device)
     method_results = defaultdict(list)
     save_path, local_model_dir = prepare_checkpoint_dir(config)
+    if not os.path.exists(save_path + "/config.yaml"):
+        save_yaml_config(save_path + "/config.yaml", config)
     local_models = [copy.deepcopy(global_model) for _ in range(config['client']['num_clients'])]
     local_data_size = [len(client_idx_map[c]) for c in range(config['client']['num_clients'])]
     if config['server']['aggregated_by_datasize']:
@@ -1453,7 +1139,8 @@ def OneshotOursV12(trainset, test_loader, client_idx_map, config, device, **kwar
         model_name=config['server']['model_name'],
         num_classes=config['dataset']['num_classes'],
         mode='our',
-        use_pretrain=use_pretrain_arg
+        use_pretrain=use_pretrain_arg,
+        in_channel=config['dataset'].get('channels', 3)
     )
     feature_dim = global_model.learnable_proto.shape[1]
     num_classes = config['dataset']['num_classes']
@@ -1605,7 +1292,8 @@ def OneshotOursV13(trainset, test_loader, client_idx_map, config, device, gamma_
         model_name=config['server']['model_name'],
         num_classes=config['dataset']['num_classes'],
         mode='our',
-        use_pretrain=use_pretrain_arg
+        use_pretrain=use_pretrain_arg,
+        in_channel=config['dataset'].get('channels', 3)
     )
     feature_dim = global_model.learnable_proto.shape[1]
     num_classes = config['dataset']['num_classes']
@@ -1740,6 +1428,7 @@ def OneshotOursV14(trainset, test_loader, client_idx_map, config, device, gamma_
     v10_cfg = config.get('v10_config', {})
     
     use_pretrain_bool = config.get('DBCD', {}).get('use_pretrain', False)
+    use_imagenet_pretrain = config.get('DBCD', {}).get('use_imagenet_pretrain', False)
     custom_pretrain_path = config.get('pretrain', {}).get('model_path', '')
     dataset_name_lower = config['dataset']['data_name'].lower()
     model_name = config['server']['model_name']
@@ -1751,14 +1440,18 @@ def OneshotOursV14(trainset, test_loader, client_idx_map, config, device, gamma_
             use_pretrain_arg = expected_custom_path
             logger.info(f"[OneshotOursV14] Found custom centralized weights at {expected_custom_path}. Using them!")
         else:
-            use_pretrain_arg = False # Changed from True
-            logger.warning(f"[OneshotOursV14] Custom weights NOT found at {expected_custom_path}. Using Random Initialization (ImageNet Disabled).")
+            use_pretrain_arg = False
+            logger.warning(f"[OneshotOursV14] Custom weights NOT found at {expected_custom_path}. Using Random Initialization.")
+    elif use_imagenet_pretrain:
+        use_pretrain_arg = True
+        logger.info("[OneshotOursV14] Loading ImageNet pretrained weights for ResNet-18.")
 
     global_model = get_train_models(
         model_name=config['server']['model_name'],
         num_classes=config['dataset']['num_classes'],
         mode='our',
-        use_pretrain=use_pretrain_arg
+        use_pretrain=use_pretrain_arg,
+        in_channel=config['dataset'].get('channels', 3)
     )
     feature_dim = global_model.learnable_proto.shape[1]
     num_classes = config['dataset']['num_classes']
@@ -1894,7 +1587,8 @@ def OneshotFAFIFedAvg(trainset, test_loader, client_idx_map, config, device, lam
         model_name=config['server']['model_name'],
         num_classes=config['dataset']['num_classes'],
         mode='our'
-    )
+    ,
+        in_channel=config['dataset'].get('channels', 3))
     global_model.to(device)
     global_model.train()
 
@@ -1986,7 +1680,8 @@ def OneshotAURORAFedAvg(trainset, test_loader, client_idx_map, config, device, g
         model_name=config['server']['model_name'],
         num_classes=config['dataset']['num_classes'],
         mode='our'
-    )
+    ,
+        in_channel=config['dataset'].get('channels', 3))
     feature_dim = global_model.learnable_proto.shape[1]
     num_classes = config['dataset']['num_classes']
     etf_anchors = generate_etf_anchors(num_classes, feature_dim, device)
@@ -2115,11 +1810,13 @@ def OneshotOursV15(trainset, test_loader, client_idx_map, config, device, gamma_
             use_pretrain_arg = False # Changed from True
             logger.warning(f"[OneshotOursV15] Custom weights NOT found at {expected_custom_path}. Using Random Initialization (ImageNet Disabled).")
 
+    in_channel = config['dataset'].get('channels', 3)
     global_model = get_train_models(
         model_name=config['server']['model_name'],
         num_classes=config['dataset']['num_classes'],
-        mode='our_projector',
-        use_pretrain=use_pretrain_arg
+        mode='our',
+        use_pretrain=use_pretrain_arg,
+        in_channel=in_channel
     )
     
     feature_dim = global_model.learnable_proto.shape[1]
@@ -2244,15 +1941,652 @@ def OneshotOursV15(trainset, test_loader, client_idx_map, config, device, gamma_
         save_yaml_config(save_path + "/baselines_" + method_name +"_" + config['checkpoint']['result_file'], method_results)
 
 
-# [ABLATION] Function to demonstrate Feature Collapse when gradients are NOT detached
-def OneshotOurs_FeatureCollapse_Ablation(trainset, test_loader, client_idx_map, config, device, lambda_val=0):
+def OneshotOursV16(trainset, test_loader, client_idx_map, config, device, gamma_reg, lambda_max=50.0, **kwargs):
+    logger.info('OneshotOursV16: AURORA with Reclassified Losses (Task vs Regularization)')
+    
+    v10_cfg = config.get('v10_config', {})
+    
+    use_pretrain_bool = config.get('DBCD', {}).get('use_pretrain', False)
+    use_imagenet_pretrain = config.get('DBCD', {}).get('use_imagenet_pretrain', False)
+    custom_pretrain_path = config.get('pretrain', {}).get('model_path', '')
+    dataset_name_lower = config['dataset']['data_name'].lower()
+    model_name = config['server']['model_name']
+    expected_custom_path = os.path.join(custom_pretrain_path, f"{dataset_name_lower}_{model_name}_centralized.pth")
+    
+    use_pretrain_arg = False
+    if use_pretrain_bool:
+        if os.path.exists(expected_custom_path):
+            use_pretrain_arg = expected_custom_path
+            logger.info(f"[OneshotOursV16] Found custom centralized weights at {expected_custom_path}. Using them!")
+        else:
+            use_pretrain_arg = False
+            logger.warning(f"[OneshotOursV16] Custom weights NOT found at {expected_custom_path}. Using Random Initialization.")
+    elif use_imagenet_pretrain:
+        use_pretrain_arg = True
+        logger.info("[OneshotOursV16] Loading ImageNet pretrained weights for ResNet-18.")
+
+    global_model = get_train_models(
+        model_name=config['server']['model_name'],
+        num_classes=config['dataset']['num_classes'],
+        mode='our',
+        use_pretrain=use_pretrain_arg,
+        in_channel=config['dataset'].get('channels', 3)
+    )
+    feature_dim = global_model.learnable_proto.shape[1]
+    num_classes = config['dataset']['num_classes']
+    etf_anchors = generate_etf_anchors(num_classes, feature_dim, device)
+    method_results = defaultdict(list)
+    save_path, local_model_dir = prepare_checkpoint_dir(config)
+    if not os.path.exists(save_path + "/config.yaml"):
+        save_yaml_config(save_path + "/config.yaml", config)
+    local_models = [copy.deepcopy(global_model) for _ in range(config['client']['num_clients'])]
+    local_data_size = [len(client_idx_map[c]) for c in range(config['client']['num_clients'])]
+    if config['server']['aggregated_by_datasize']:
+        weights = [i/sum(local_data_size) for i in local_data_size]
+    else:
+        weights = [1/config['client']['num_clients'] for _ in range(config['client']['num_clients'])]        
+    aug_transformer = get_supcon_transform(config['dataset']['data_name'])
+    clients_sample_per_class = []
+    
+    logger.info("--- Pre-heating V16 models with loss-ratio calibration ---")
+    
+    for c in range(config['client']['num_clients']):
+        client_dataloader = get_client_dataloader(client_idx_map[c], trainset, config['dataset']['train_batch_size'])
+        
+        model_copy = copy.deepcopy(local_models[c]).to(device)
+        model_copy.eval()
+        with torch.no_grad():
+            batch = next(iter(client_dataloader))
+            data, target = batch[0].to(device), batch[1].to(device)
+            bsz = data.shape[0]
+            
+            logits, feature_norm = model_copy(data)
+            cls_val = torch.nn.functional.cross_entropy(logits, target).item()
+            
+            # Calibration uses a single forward pass (one view), so features match single-batch labels.
+            # SupConLoss needs paired views — skip it in calibration; proto losses dominate reg_val anyway.
+            unique_classes = torch.unique(target)
+            pf_val = Contrastive_proto_feature_loss(temperature=1.0)(
+                feature_norm, model_copy.learnable_proto, target, active_indices=unique_classes
+            ).item()
+            pc_val = Contrastive_proto_loss(temperature=1.0)(
+                model_copy.learnable_proto, active_indices=unique_classes
+            ).item()
+            
+            reg_val = pf_val + pc_val  # SupCon skipped (needs 2 views)
+            
+            if reg_val > 1e-6:
+                initial_lambda = min(max(cls_val / reg_val, 0.01), 2.0)
+            else:
+                initial_lambda = 0.5
+        
+        del model_copy
+        
+        logger.info(f"Client {c}: cls={cls_val:.4f}, reg={reg_val:.4f}, initial_lambda={initial_lambda:.4f}")
+        local_models[c] = local_models[c].to(device)
+        initial_log_lambda = torch.tensor(initial_lambda, device=device).log()
+        local_models[c].log_sigma_sq_local = torch.nn.Parameter(initial_log_lambda)
+        local_models[c].log_sigma_sq_align = torch.nn.Parameter(torch.tensor(0.0, device=device))
+    logger.info("--- V16 model pre-heating complete. ---")
+
+    logger.info(f"Gamma for stability anchor regularization: {gamma_reg}")
+
+    sigma_lr_val = v10_cfg.get('sigma_lr', 0.005)
+    total_rounds = config['server']['num_rounds']
+
+    for cr in trange(total_rounds):
+        logger.info(f"Round {cr} starts--------|")
+        local_protos = []
+        
+        for c in range(config['client']['num_clients']):
+            logger.info(f"Client {c} Starts Local Trainning--------|")
+            client_dataloader = get_client_dataloader(client_idx_map[c], trainset, config['dataset']['train_batch_size'])
+
+            if cr == 0:
+                clients_sample_per_class.append(generate_sample_per_class(config['dataset']['num_classes'], client_dataloader, len(client_idx_map[c])))
+
+            local_model_c = ours_local_training(
+                model=copy.deepcopy(local_models[c]),
+                training_data=client_dataloader,
+                test_dataloader=test_loader,
+                start_epoch=cr * config['server']['local_epochs'],
+                local_epochs=config['server']['local_epochs'],
+                optim_name=config['server']['optimizer'],
+                lr=config['server']['lr'],
+                momentum=config['server']['momentum'],
+                loss_name=config['server']['loss_name'],
+                device=device,
+                num_classes=config['dataset']['num_classes'],
+                sample_per_class=clients_sample_per_class[c],
+                aug_transformer=aug_transformer,
+                client_model_dir=local_model_dir + f"/client_{c}",
+                total_rounds=total_rounds,
+                use_drcl=True,
+                fixed_anchors=etf_anchors,
+                use_uncertainty_weighting=True,
+                sigma_lr=sigma_lr_val,
+                use_dynamic_task_attenuation=True,
+                gamma_reg=gamma_reg,
+                lambda_max=lambda_max,
+                use_reclassified_losses=True
+            )
+            
+            local_models[c] = local_model_c
+            local_protos.append(local_model_c.get_proto().detach())
+
+            log_sigma_sq_local_val = local_model_c.log_sigma_sq_local.item()
+            log_sigma_sq_align_val = local_model_c.log_sigma_sq_align.item()
+            raw_lambda = math.exp(log_sigma_sq_local_val - log_sigma_sq_align_val)
+            
+            end_epoch_of_this_round = (cr + 1) * config['server']['local_epochs']
+            total_training_epochs = config['server']['num_rounds'] * config['server']['local_epochs']
+            global_progress = end_epoch_of_this_round / total_training_epochs
+            s_p_value = max(0.0, 1.0 - global_progress)
+            truly_effective_lambda = raw_lambda * s_p_value
+
+            logger.info(
+                f"Client {c} Post-Training State -> "
+                f"Raw λ: {raw_lambda:9.4f} "
+                f"| s(p): {s_p_value:.3f} "
+                f"| Truly Effective λ (for W): {truly_effective_lambda:9.4f}"
+            )
+
+        logger.info(f"Round {cr} Finish--------|")
+        
+        method_name = 'OursV16+SimpleFeatureServer'
+        ensemble_model = WEnsembleFeature(model_list=local_models, weight_list=weights)
+        global_proto = aggregate_local_protos(local_protos)
+        ens_acc = eval_with_proto(ensemble_model, test_loader, device, global_proto)
+        logger.info(f"The test accuracy of {method_name}: {ens_acc}")
+        method_results[method_name].append(ens_acc)
+        save_yaml_config(save_path + "/baselines_" + method_name +"_" + config['checkpoint']['result_file'], method_results)
+
+
+def OneshotOursV17(trainset, test_loader, client_idx_map, config, device, gamma_reg, lambda_max=50.0, **kwargs):
+    logger.info('OneshotOursV17: AURORA with Dual-Head (Linear Classification + Proto Alignment)')
+    
+    v10_cfg = config.get('v10_config', {})
+    
+    use_pretrain_bool = config.get('DBCD', {}).get('use_pretrain', False)
+    use_imagenet_pretrain = config.get('DBCD', {}).get('use_imagenet_pretrain', False)
+    custom_pretrain_path = config.get('pretrain', {}).get('model_path', '')
+    dataset_name_lower = config['dataset']['data_name'].lower()
+    model_name = config['server']['model_name']
+    expected_custom_path = os.path.join(custom_pretrain_path, f"{dataset_name_lower}_{model_name}_centralized.pth")
+    
+    use_pretrain_arg = False
+    if use_pretrain_bool:
+        if os.path.exists(expected_custom_path):
+            use_pretrain_arg = expected_custom_path
+            logger.info(f"[OneshotOursV17] Found custom centralized weights at {expected_custom_path}. Using them!")
+        else:
+            use_pretrain_arg = False
+            logger.warning(f"[OneshotOursV17] Custom weights NOT found at {expected_custom_path}. Using Random Initialization.")
+    elif use_imagenet_pretrain:
+        use_pretrain_arg = True
+        logger.info("[OneshotOursV17] Loading ImageNet pretrained weights for ResNet-18.")
+
+    global_model = get_train_models(
+        model_name=config['server']['model_name'],
+        num_classes=config['dataset']['num_classes'],
+        mode='our_dual',
+        use_pretrain=use_pretrain_arg,
+        in_channel=config['dataset'].get('channels', 3)
+    )
+    feature_dim = global_model.learnable_proto.shape[1]
+    num_classes = config['dataset']['num_classes']
+    etf_anchors = generate_etf_anchors(num_classes, feature_dim, device)
+    method_results = defaultdict(list)
+    save_path, local_model_dir = prepare_checkpoint_dir(config)
+    if not os.path.exists(save_path + "/config.yaml"):
+        save_yaml_config(save_path + "/config.yaml", config)
+    local_models = [copy.deepcopy(global_model) for _ in range(config['client']['num_clients'])]
+    local_data_size = [len(client_idx_map[c]) for c in range(config['client']['num_clients'])]
+    if config['server']['aggregated_by_datasize']:
+        weights = [i/sum(local_data_size) for i in local_data_size]
+    else:
+        weights = [1/config['client']['num_clients'] for _ in range(config['client']['num_clients'])]        
+    aug_transformer = get_gpu_augmentation(config['dataset']['data_name'], device)
+    clients_sample_per_class = []
+    
+    logger.info("--- Pre-heating V17 models with loss-ratio calibration ---")
+    
+    for c in range(config['client']['num_clients']):
+        client_dataloader = get_client_dataloader(client_idx_map[c], trainset, config['dataset']['train_batch_size'])
+        
+        model_copy = copy.deepcopy(local_models[c]).to(device)
+        model_copy.eval()
+        with torch.no_grad():
+            batch = next(iter(client_dataloader))
+            data, target = batch[0].to(device), batch[1].to(device)
+            
+            logits, feature_norm = model_copy(data)
+            cls_val = F.cross_entropy(logits, target).item()
+            
+            unique_classes = torch.unique(target)
+            pf_val = Contrastive_proto_feature_loss(temperature=1.0)(
+                feature_norm, model_copy.learnable_proto, target, active_indices=unique_classes
+            ).item()
+            pc_val = Contrastive_proto_loss(temperature=1.0)(
+                model_copy.learnable_proto, active_indices=unique_classes
+            ).item()
+            
+            reg_val = pf_val + pc_val
+            
+            if reg_val > 1e-6:
+                initial_lambda = min(max(cls_val / reg_val, 0.01), 2.0)
+            else:
+                initial_lambda = 0.5
+        
+        del model_copy
+        
+        logger.info(f"Client {c}: cls={cls_val:.4f}, reg={reg_val:.4f}, initial_lambda={initial_lambda:.4f}")
+        local_models[c] = local_models[c].to(device)
+        initial_log_lambda = torch.tensor(initial_lambda, device=device).log()
+        local_models[c].log_sigma_sq_local = torch.nn.Parameter(initial_log_lambda)
+        local_models[c].log_sigma_sq_align = torch.nn.Parameter(torch.tensor(0.0, device=device))
+    logger.info("--- V17 model pre-heating complete. ---")
+
+    logger.info(f"Gamma for stability anchor regularization: {gamma_reg}")
+
+    sigma_lr_val = v10_cfg.get('sigma_lr', 0.005)
+    total_rounds = config['server']['num_rounds']
+
+    for cr in trange(total_rounds):
+        logger.info(f"Round {cr} starts--------|")
+        local_protos = []
+        
+        for c in range(config['client']['num_clients']):
+            logger.info(f"Client {c} Starts Local Trainning--------|")
+            client_dataloader = get_client_dataloader(client_idx_map[c], trainset, config['dataset']['train_batch_size'])
+
+            if cr == 0:
+                clients_sample_per_class.append(generate_sample_per_class(config['dataset']['num_classes'], client_dataloader, len(client_idx_map[c])))
+
+            local_model_c = ours_local_training(
+                model=copy.deepcopy(local_models[c]),
+                training_data=client_dataloader,
+                test_dataloader=test_loader,
+                start_epoch=cr * config['server']['local_epochs'],
+                local_epochs=config['server']['local_epochs'],
+                optim_name=config['server']['optimizer'],
+                lr=config['server']['lr'],
+                momentum=config['server']['momentum'],
+                loss_name=config['server']['loss_name'],
+                device=device,
+                num_classes=config['dataset']['num_classes'],
+                sample_per_class=clients_sample_per_class[c],
+                aug_transformer=aug_transformer,
+                client_model_dir=local_model_dir + f"/client_{c}",
+                total_rounds=total_rounds,
+                use_drcl=True,
+                fixed_anchors=etf_anchors,
+                use_uncertainty_weighting=True,
+                sigma_lr=sigma_lr_val,
+                use_dynamic_task_attenuation=True,
+                gamma_reg=gamma_reg,
+                lambda_max=lambda_max,
+                use_reclassified_losses=True
+            )
+            
+            local_models[c] = local_model_c
+            local_protos.append(local_model_c.get_proto().detach())
+
+            log_sigma_sq_local_val = local_model_c.log_sigma_sq_local.item()
+            log_sigma_sq_align_val = local_model_c.log_sigma_sq_align.item()
+            raw_lambda = math.exp(log_sigma_sq_local_val - log_sigma_sq_align_val)
+            
+            end_epoch_of_this_round = (cr + 1) * config['server']['local_epochs']
+            total_training_epochs = config['server']['num_rounds'] * config['server']['local_epochs']
+            global_progress = end_epoch_of_this_round / total_training_epochs
+            s_p_value = max(0.0, 1.0 - global_progress)
+            truly_effective_lambda = raw_lambda * s_p_value
+
+            logger.info(
+                f"Client {c} Post-Training State -> "
+                f"Raw λ: {raw_lambda:9.4f} "
+                f"| s(p): {s_p_value:.3f} "
+                f"| Truly Effective λ (for W): {truly_effective_lambda:9.4f}"
+            )
+
+        logger.info(f"Round {cr} Finish--------|")
+
+        g_protos = torch.stack(local_protos)
+        g_protos_std = g_protos.std(dim=0).norm().item()
+        inter_proto_std = g_protos_std / g_protos.norm(dim=2).mean().item()
+        logger.info(f"g_protos_std (global internal): {g_protos_std}")
+        logger.info(f"inter_client_proto_std (cross-client): {inter_proto_std}")
+
+        method_name = 'OursV17+ProtoInference'
+        ensemble_model = WEnsembleFeature(model_list=local_models, weight_list=weights)
+        global_proto = aggregate_local_protos(local_protos)
+        ens_acc = eval_with_proto(ensemble_model, test_loader, device, global_proto)
+        logger.info(f"The test accuracy of {method_name}: {ens_acc}")
+        method_results[method_name].append(ens_acc)
+        save_yaml_config(save_path + "/baselines_" + method_name +"_" + config['checkpoint']['result_file'], method_results)
+
+
+
+def OneshotOursV18(trainset, test_loader, client_idx_map, config, device, gamma_reg, lambda_max=50.0, **kwargs):
+    logger.info('OneshotOursV18: AURORA with Reclassified Losses + No Annealing')
+    
+    v10_cfg = config.get('v10_config', {})
+    
+    use_pretrain_bool = config.get('DBCD', {}).get('use_pretrain', False)
+    use_imagenet_pretrain = config.get('DBCD', {}).get('use_imagenet_pretrain', False)
+    custom_pretrain_path = config.get('pretrain', {}).get('model_path', '')
+    dataset_name_lower = config['dataset']['data_name'].lower()
+    model_name = config['server']['model_name']
+    expected_custom_path = os.path.join(custom_pretrain_path, f"{dataset_name_lower}_{model_name}_centralized.pth")
+    
+    use_pretrain_arg = False
+    if use_pretrain_bool:
+        if os.path.exists(expected_custom_path):
+            use_pretrain_arg = expected_custom_path
+            logger.info(f"[OneshotOursV18] Found custom centralized weights at {expected_custom_path}. Using them!")
+        else:
+            use_pretrain_arg = False
+            logger.warning(f"[OneshotOursV18] Custom weights NOT found at {expected_custom_path}. Using Random Initialization.")
+    elif use_imagenet_pretrain:
+        use_pretrain_arg = True
+        logger.info("[OneshotOursV18] Loading ImageNet pretrained weights for ResNet-18.")
+
+    global_model = get_train_models(
+        model_name=config['server']['model_name'],
+        num_classes=config['dataset']['num_classes'],
+        mode='our',
+        use_pretrain=use_pretrain_arg,
+        in_channel=config['dataset'].get('channels', 3)
+    )
+    feature_dim = global_model.learnable_proto.shape[1]
+    num_classes = config['dataset']['num_classes']
+    etf_anchors = generate_etf_anchors(num_classes, feature_dim, device)
+    method_results = defaultdict(list)
+    save_path, local_model_dir = prepare_checkpoint_dir(config)
+    if not os.path.exists(save_path + "/config.yaml"):
+        save_yaml_config(save_path + "/config.yaml", config)
+    local_models = [copy.deepcopy(global_model) for _ in range(config['client']['num_clients'])]
+    local_data_size = [len(client_idx_map[c]) for c in range(config['client']['num_clients'])]
+    if config['server']['aggregated_by_datasize']:
+        weights = [i/sum(local_data_size) for i in local_data_size]
+    else:
+        weights = [1/config['client']['num_clients'] for _ in range(config['client']['num_clients'])]        
+    aug_transformer = get_supcon_transform(config['dataset']['data_name'])
+    clients_sample_per_class = []
+    
+    logger.info("--- Pre-heating V18 models with loss-ratio calibration ---")
+    
+    for c in range(config['client']['num_clients']):
+        client_dataloader = get_client_dataloader(client_idx_map[c], trainset, config['dataset']['train_batch_size'])
+        
+        model_copy = copy.deepcopy(local_models[c]).to(device)
+        model_copy.eval()
+        with torch.no_grad():
+            batch = next(iter(client_dataloader))
+            data, target = batch[0].to(device), batch[1].to(device)
+            
+            logits, feature_norm = model_copy(data)
+            cls_val = torch.nn.functional.cross_entropy(logits, target).item()
+            
+            unique_classes = torch.unique(target)
+            pf_val = Contrastive_proto_feature_loss(temperature=1.0)(
+                feature_norm, model_copy.learnable_proto, target, active_indices=unique_classes
+            ).item()
+            pc_val = Contrastive_proto_loss(temperature=1.0)(
+                model_copy.learnable_proto, active_indices=unique_classes
+            ).item()
+            
+            reg_val = pf_val + pc_val
+            
+            if reg_val > 1e-6:
+                initial_lambda = min(max(cls_val / reg_val, 0.01), 2.0)
+            else:
+                initial_lambda = 0.5
+        
+        del model_copy
+        
+        logger.info(f"Client {c}: cls={cls_val:.4f}, reg={reg_val:.4f}, initial_lambda={initial_lambda:.4f}")
+        local_models[c] = local_models[c].to(device)
+        initial_log_lambda = torch.tensor(initial_lambda, device=device).log()
+        local_models[c].log_sigma_sq_local = torch.nn.Parameter(initial_log_lambda)
+        local_models[c].log_sigma_sq_align = torch.nn.Parameter(torch.tensor(0.0, device=device))
+    logger.info("--- V18 model pre-heating complete. ---")
+
+    logger.info(f"Gamma for stability anchor regularization: {gamma_reg}")
+
+    sigma_lr_val = v10_cfg.get('sigma_lr', 0.005)
+    total_rounds = config['server']['num_rounds']
+    local_epochs = config['server']['local_epochs']
+    warmup_ep = local_epochs // 2  # First half of each round is warmup (pure CE, no augmentation)
+
+    for cr in trange(total_rounds):
+        logger.info(f"Round {cr} starts--------|")
+        local_protos = []
+        
+        for c in range(config['client']['num_clients']):
+            logger.info(f"Client {c} Starts Local Trainning--------|")
+            client_dataloader = get_client_dataloader(client_idx_map[c], trainset, config['dataset']['train_batch_size'])
+
+            if cr == 0:
+                clients_sample_per_class.append(generate_sample_per_class(config['dataset']['num_classes'], client_dataloader, len(client_idx_map[c])))
+
+            start_ep = cr * local_epochs
+            local_model_c = ours_local_training(
+                model=copy.deepcopy(local_models[c]),
+                training_data=client_dataloader,
+                test_dataloader=test_loader,
+                start_epoch=start_ep,
+                local_epochs=local_epochs,
+                optim_name=config['server']['optimizer'],
+                lr=config['server']['lr'],
+                momentum=config['server']['momentum'],
+                loss_name=config['server']['loss_name'],
+                device=device,
+                num_classes=config['dataset']['num_classes'],
+                sample_per_class=clients_sample_per_class[c],
+                aug_transformer=aug_transformer,
+                client_model_dir=local_model_dir + f"/client_{c}",
+                total_rounds=total_rounds,
+                use_drcl=True,
+                fixed_anchors=etf_anchors,
+                use_uncertainty_weighting=True,
+                sigma_lr=sigma_lr_val,
+                use_dynamic_task_attenuation=False,
+                gamma_reg=gamma_reg,
+                lambda_max=lambda_max,
+                use_reclassified_losses=True,
+                warmup_epochs=warmup_ep
+            )
+            
+            local_models[c] = local_model_c
+            local_protos.append(local_model_c.get_proto().detach())
+
+            log_sigma_sq_local_val = local_model_c.log_sigma_sq_local.item()
+            log_sigma_sq_align_val = local_model_c.log_sigma_sq_align.item()
+            raw_lambda = math.exp(log_sigma_sq_local_val - log_sigma_sq_align_val)
+
+            logger.info(
+                f"Client {c} Post-Training State -> "
+                f"Raw λ: {raw_lambda:9.4f}"
+            )
+
+        logger.info(f"Round {cr} Finish--------|")
+
+        method_name = 'OursV18+WarmupNoAnneal'
+        ensemble_model = WEnsembleFeature(model_list=local_models, weight_list=weights)
+        global_proto = aggregate_local_protos(local_protos)
+        ens_acc = eval_with_proto(ensemble_model, test_loader, device, global_proto)
+        logger.info(f"The test accuracy of {method_name}: {ens_acc}")
+        method_results[method_name].append(ens_acc)
+        save_yaml_config(save_path + "/baselines_" + method_name +"_" + config['checkpoint']['result_file'], method_results)
+
+
+def OneshotOursV19(trainset, test_loader, client_idx_map, config, device, gamma_reg, lambda_max=50.0, **kwargs):
+    logger.info('OneshotOursV19: AURORA with Decaying Warmup')
+    
+    v10_cfg = config.get('v10_config', {})
+    
+    use_pretrain_bool = config.get('DBCD', {}).get('use_pretrain', False)
+    use_imagenet_pretrain = config.get('DBCD', {}).get('use_imagenet_pretrain', False)
+    custom_pretrain_path = config.get('pretrain', {}).get('model_path', '')
+    dataset_name_lower = config['dataset']['data_name'].lower()
+    model_name = config['server']['model_name']
+    expected_custom_path = os.path.join(custom_pretrain_path, f"{dataset_name_lower}_{model_name}_centralized.pth")
+    
+    use_pretrain_arg = False
+    if use_pretrain_bool:
+        if os.path.exists(expected_custom_path):
+            use_pretrain_arg = expected_custom_path
+            logger.info(f"[OneshotOursV19] Found custom centralized weights at {expected_custom_path}. Using them!")
+        else:
+            use_pretrain_arg = False
+            logger.warning(f"[OneshotOursV19] Custom weights NOT found at {expected_custom_path}. Using Random Initialization.")
+    elif use_imagenet_pretrain:
+        use_pretrain_arg = True
+        logger.info("[OneshotOursV19] Loading ImageNet pretrained weights for ResNet-18.")
+
+    global_model = get_train_models(
+        model_name=config['server']['model_name'],
+        num_classes=config['dataset']['num_classes'],
+        mode='our',
+        use_pretrain=use_pretrain_arg,
+        in_channel=config['dataset'].get('channels', 3)
+    )
+    feature_dim = global_model.learnable_proto.shape[1]
+    num_classes = config['dataset']['num_classes']
+    etf_anchors = generate_etf_anchors(num_classes, feature_dim, device)
+    method_results = defaultdict(list)
+    save_path, local_model_dir = prepare_checkpoint_dir(config)
+    if not os.path.exists(save_path + "/config.yaml"):
+        save_yaml_config(save_path + "/config.yaml", config)
+    local_models = [copy.deepcopy(global_model) for _ in range(config['client']['num_clients'])]
+    local_data_size = [len(client_idx_map[c]) for c in range(config['client']['num_clients'])]
+    if config['server']['aggregated_by_datasize']:
+        weights = [i/sum(local_data_size) for i in local_data_size]
+    else:
+        weights = [1/config['client']['num_clients'] for _ in range(config['client']['num_clients'])]        
+    aug_transformer = get_supcon_transform(config['dataset']['data_name'])
+    clients_sample_per_class = []
+    
+    logger.info("--- Pre-heating V19 models with loss-ratio calibration ---")
+    
+    for c in range(config['client']['num_clients']):
+        client_dataloader = get_client_dataloader(client_idx_map[c], trainset, config['dataset']['train_batch_size'])
+        
+        model_copy = copy.deepcopy(local_models[c]).to(device)
+        model_copy.eval()
+        with torch.no_grad():
+            batch = next(iter(client_dataloader))
+            data, target = batch[0].to(device), batch[1].to(device)
+            
+            logits, feature_norm = model_copy(data)
+            cls_val = torch.nn.functional.cross_entropy(logits, target).item()
+            
+            unique_classes = torch.unique(target)
+            pf_val = Contrastive_proto_feature_loss(temperature=1.0)(
+                feature_norm, model_copy.learnable_proto, target, active_indices=unique_classes
+            ).item()
+            pc_val = Contrastive_proto_loss(temperature=1.0)(
+                model_copy.learnable_proto, active_indices=unique_classes
+            ).item()
+            
+            reg_val = pf_val + pc_val
+            
+            if reg_val > 1e-6:
+                initial_lambda = min(max(cls_val / reg_val, 0.01), 2.0)
+            else:
+                initial_lambda = 0.5
+        
+        del model_copy
+        
+        logger.info(f"Client {c}: cls={cls_val:.4f}, reg={reg_val:.4f}, initial_lambda={initial_lambda:.4f}")
+        local_models[c] = local_models[c].to(device)
+        initial_log_lambda = torch.tensor(initial_lambda, device=device).log()
+        local_models[c].log_sigma_sq_local = torch.nn.Parameter(initial_log_lambda)
+        local_models[c].log_sigma_sq_align = torch.nn.Parameter(torch.tensor(0.0, device=device))
+    logger.info("--- V19 model pre-heating complete. ---")
+
+    logger.info(f"Gamma for stability anchor regularization: {gamma_reg}")
+
+    sigma_lr_val = v10_cfg.get('sigma_lr', 0.005)
+    total_rounds = config['server']['num_rounds']
+    local_epochs = config['server']['local_epochs']
+    base_warmup = local_epochs // 2
+
+    for cr in trange(total_rounds):
+        # Decaying warmup: full warmup at round 0, linearly decay to 0 at last round
+        warmup_ep = max(0, int(base_warmup * (1 - cr / max(1, total_rounds - 1))))
+        logger.info(f"Round {cr} starts--------| warmup_epochs={warmup_ep}")
+        local_protos = []
+        
+        for c in range(config['client']['num_clients']):
+            logger.info(f"Client {c} Starts Local Trainning--------|")
+            client_dataloader = get_client_dataloader(client_idx_map[c], trainset, config['dataset']['train_batch_size'])
+
+            if cr == 0:
+                clients_sample_per_class.append(generate_sample_per_class(config['dataset']['num_classes'], client_dataloader, len(client_idx_map[c])))
+
+            start_ep = cr * local_epochs
+            local_model_c = ours_local_training(
+                model=copy.deepcopy(local_models[c]),
+                training_data=client_dataloader,
+                test_dataloader=test_loader,
+                start_epoch=start_ep,
+                local_epochs=local_epochs,
+                optim_name=config['server']['optimizer'],
+                lr=config['server']['lr'],
+                momentum=config['server']['momentum'],
+                loss_name=config['server']['loss_name'],
+                device=device,
+                num_classes=config['dataset']['num_classes'],
+                sample_per_class=clients_sample_per_class[c],
+                aug_transformer=aug_transformer,
+                client_model_dir=local_model_dir + f"/client_{c}",
+                total_rounds=total_rounds,
+                use_drcl=True,
+                fixed_anchors=etf_anchors,
+                use_uncertainty_weighting=True,
+                sigma_lr=sigma_lr_val,
+                use_dynamic_task_attenuation=False,
+                gamma_reg=gamma_reg,
+                lambda_max=lambda_max,
+                use_reclassified_losses=True,
+                warmup_epochs=warmup_ep,
+                use_confidence_gating=False
+            )
+            
+            local_models[c] = local_model_c
+            local_protos.append(local_model_c.get_proto().detach())
+
+            log_sigma_sq_local_val = local_model_c.log_sigma_sq_local.item()
+            log_sigma_sq_align_val = local_model_c.log_sigma_sq_align.item()
+            raw_lambda = math.exp(log_sigma_sq_local_val - log_sigma_sq_align_val)
+
+            logger.info(
+                f"Client {c} Post-Training State -> "
+                f"Raw λ: {raw_lambda:9.4f}"
+            )
+
+        logger.info(f"Round {cr} Finish--------|")
+
+        method_name = 'OursV19+DecayingWarmup'
+        ensemble_model = WEnsembleFeature(model_list=local_models, weight_list=weights)
+        global_proto = aggregate_local_protos(local_protos)
+        ens_acc = eval_with_proto(ensemble_model, test_loader, device, global_proto)
+        logger.info(f"The test accuracy of {method_name}: {ens_acc}")
+        method_results[method_name].append(ens_acc)
+        save_yaml_config(save_path + "/baselines_" + method_name +"_" + config['checkpoint']['result_file'], method_results)
+
+
+
     logger.info('Running Feature Collapse Ablation: Direct Alignment (No Detach)')
     
     global_model = get_train_models(
         model_name=config['server']['model_name'],
         num_classes=config['dataset']['num_classes'],
         mode='our'
-    )
+    ,
+        in_channel=config['dataset'].get('channels', 3))
     global_model.to(device)
     global_model.train()
 

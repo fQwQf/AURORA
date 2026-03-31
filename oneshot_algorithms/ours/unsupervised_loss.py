@@ -139,13 +139,17 @@ class Contrastive_proto_feature_loss(torch.nn.Module):
     def __init__(self, temperature=0.5):
         super(Contrastive_proto_feature_loss, self).__init__()
         self.temperature = temperature
+    
+    def forward(self, feature, proto, labels, active_indices=None):
+        if active_indices is not None:
+            proto = proto[active_indices]
+            label_map = {c.item(): i for i, c in enumerate(active_indices)}
+            mapped_labels = torch.tensor([label_map[l.item()] for l in labels], device=labels.device)
+        else:
+            mapped_labels = labels
         
-    def forward(self, feature, proto, labels):
-        # Compute similarity matrix
         similarity_matrix = torch.matmul(feature, proto.T) / self.temperature
-        
-        # same label prototype should similar with the corresponding feature
-        loss = torch.nn.functional.cross_entropy(similarity_matrix, labels)
+        loss = torch.nn.functional.cross_entropy(similarity_matrix, mapped_labels)
         
         return loss
     
@@ -154,16 +158,32 @@ class Contrastive_proto_loss(torch.nn.Module):
         super(Contrastive_proto_loss, self).__init__()
         self.temperature = temperature
     
-    def forward(self, proto):
-        proto_len = proto.shape[0]
+    def forward(self, proto, active_indices=None):
+        """
+        Prototype self-contrastive loss. Forces prototypes to be distinct.
+        
+        Args:
+            proto: [num_classes, feature_dim] all learnable prototypes
+            active_indices: optional tensor of class indices actually present in training data.
+                         If provided, only compute loss for these classes, This prevents
+                         gradients from flowing to prototypes for unseen classes, which
+                         is critical for non-IID settings (e.g., FEMNIST with 62 classes
+                         where each client only sees a subset).
+        """
+        if active_indices is not None:
+            # Only compute loss for classes actually present in training data
+            proto_subset = proto[active_indices]
+        else:
+            proto_subset = proto
+        
+        proto_len = proto_subset.shape[0]
+        if proto_len <= 1:
+            return torch.tensor(0.0, device=proto.device)
         
         # Compute similarity matrix
-        similarity_matrix = torch.matmul(proto, proto.T) / self.temperature
+        similarity_matrix = torch.matmul(proto_subset, proto_subset.T) / self.temperature
         
         labels = torch.arange(proto_len, device=proto.device)
-        
-        mask = torch.eye(proto_len, dtype=torch.bool, device=proto.device)
-        # similarity_matrix = similarity_matrix.masked_fill(mask, -float('inf'))
         
         loss = torch.nn.functional.cross_entropy(similarity_matrix, labels)
         

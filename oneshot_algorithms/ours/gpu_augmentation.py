@@ -33,30 +33,28 @@ class GPUSupConAugmentation(nn.Module):
             mean = (0.5, 0.5, 0.5)
             std = (0.5, 0.5, 0.5)
 
-        # Build GPU augmentation pipeline
-        # Kornia augmentations are applied sequentially
-        self.augmentation = nn.Sequential(
-            # RandomResizedCrop equivalent
+        is_grayscale = len(mean) == 1
+
+        transforms = [
             K.RandomResizedCrop(size=(img_size, img_size), scale=(0.2, 1.0), p=1.0),
-            
-            # RandomHorizontalFlip
             K.RandomHorizontalFlip(p=0.5),
-            
-            # ColorJitter with p=0.8 (applied directly, no RandomApply needed)
-            K.ColorJitter(
-                brightness=0.4,
-                contrast=0.4,
-                saturation=0.4,
-                hue=0.1,
-                p=0.8  # 80% probability of applying color jitter
-            ),
-            
-            # RandomGrayscale
-            K.RandomGrayscale(p=0.2),
-            
-            # Normalize at the END of the pipeline (data enters as [0, 1])
-            K.Normalize(mean=torch.tensor(mean), std=torch.tensor(std))
-        )
+        ]
+
+        if not is_grayscale:
+            transforms.append(
+                K.ColorJitter(
+                    brightness=0.4,
+                    contrast=0.4,
+                    saturation=0.4,
+                    hue=0.1,
+                    p=0.8
+                )
+            )
+            transforms.append(K.RandomGrayscale(p=0.2))
+
+        transforms.append(K.Normalize(mean=torch.tensor(mean), std=torch.tensor(std)))
+
+        self.augmentation = nn.Sequential(*transforms)
     
     def forward(self, x):
         """
