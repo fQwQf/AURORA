@@ -114,6 +114,16 @@ elif config_args.algo == 'OursV18':
     OneshotOursV18(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
 elif config_args.algo == 'OursV19':
     OneshotOursV19(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
+elif config_args.algo == 'OursV20':
+    OneshotOursV20(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
+elif config_args.algo == 'OursV21':
+    OneshotOursV21(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
+elif config_args.algo == 'OursV22':
+    OneshotOursV22(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
+elif config_args.algo == 'OursV23':
+    OneshotOursV23(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
+elif config_args.algo == 'OursV24':
+    OneshotOursV24(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
 elif config_args.algo == 'Ours_FeatureCollapse_Ablation':
     OneshotOurs_FeatureCollapse_Ablation(trainset, test_loader, client_idx_map, config, device, lambda_val=config_args.lambdaval)
 else:

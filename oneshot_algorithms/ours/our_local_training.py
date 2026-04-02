@@ -1,13 +1,13 @@
 from oneshot_algorithms.utils import init_optimizer, init_loss_fn, test_acc, save_best_local_model
-from oneshot_algorithms.ours.unsupervised_loss import SupConLoss, Contrastive_proto_feature_loss, Contrastive_proto_loss
+from oneshot_algorithms.ours.unsupervised_loss import SupConLoss, Contrastive_proto_feature_loss, Contrastive_proto_loss, AlignmentUniformityLoss, AlignmentLoss
 
 from common_libs import *
 import torch.nn.functional as F
 
 
 
-def ours_local_training(model, training_data, test_dataloader, start_epoch, local_epochs, optim_name, lr, momentum, loss_name, device, num_classes, sample_per_class, aug_transformer, client_model_dir, total_rounds, save_freq=1, use_drcl=False, fixed_anchors=None, lambda_align=1.0, use_progressive_alignment=False, initial_protos=None, use_uncertainty_weighting=False, sigma_lr=None, annealing_factor=1.0, use_dynamic_task_attenuation=False, gamma_reg=0, lambda_max=50.0, force_feature_alignment=False, use_reclassified_losses=False, warmup_epochs=0, use_confidence_gating=False):
-   
+def ours_local_training(model, training_data, test_dataloader, start_epoch, local_epochs, optim_name, lr, momentum, loss_name, device, num_classes, sample_per_class, aug_transformer, client_model_dir, total_rounds, save_freq=1, use_drcl=False, fixed_anchors=None, lambda_align=1.0, use_progressive_alignment=False, initial_protos=None, use_uncertainty_weighting=False, sigma_lr=None, annealing_factor=1.0, use_dynamic_task_attenuation=False, gamma_reg=0, lambda_max=50.0, force_feature_alignment=False, use_reclassified_losses=False, warmup_epochs=0, use_confidence_gating=False, use_align_uniform=False, use_align_only=False, use_raw_ce_au=False, use_raw_ce_supcon=False, use_raw_ce_flat_supcon=False, gate_power=2.0):
+    
     model.train()
     model.to(device)
 
@@ -38,6 +38,26 @@ def ours_local_training(model, training_data, test_dataloader, start_epoch, loca
     contrastive_loss_fn = SupConLoss(temperature=0.07)
     con_proto_feat_loss_fn = Contrastive_proto_feature_loss(temperature=1.0)
     con_proto_loss_fn = Contrastive_proto_loss(temperature=1.0)
+    
+    if use_align_uniform:
+        align_uniform_fn = AlignmentUniformityLoss(alpha=2, t=2)
+        logger.info("V20 mode: Using Alignment+Uniformity loss (no SupCon, no warmup needed)")
+    
+    if use_align_only:
+        align_only_fn = AlignmentLoss(alpha=2)
+        logger.info("V21 mode: Alignment-only (no uniformity), CE on raw data, consistency-gated")
+
+    if use_raw_ce_au:
+        raw_ce_au_fn = AlignmentUniformityLoss(alpha=2, t=2)
+        logger.info("V22 mode: CE on raw data + consistency-gated AU on augmented views")
+
+    if use_raw_ce_supcon:
+        raw_ce_supcon_fn = SupConLoss(temperature=0.07)
+        logger.info(f"V23 mode: CE on raw data + consistency^{gate_power}-gated SupCon on augmented views")
+
+    if use_raw_ce_flat_supcon:
+        raw_ce_flat_supcon_fn = SupConLoss(temperature=0.07)
+        logger.info("V24 mode: CE on raw data + flat SupCon on augmented views (no gate)")
 
     if use_drcl or use_progressive_alignment:
         alignment_loss_fn = torch.nn.MSELoss()
@@ -55,11 +75,92 @@ def ours_local_training(model, training_data, test_dataloader, start_epoch, loca
             data, target = data.to(device), target.to(device)
 
             if in_warmup:
-                # Legacy warmup: pure CE on raw data
                 optimizer.zero_grad()
                 logits, feature_norm = model(data)
                 base_loss = cls_loss_fn(logits, target)
                 loss = base_loss
+            elif use_align_only:
+                optimizer.zero_grad()
+                
+                logits_raw, _ = model(data)
+                cls_loss = cls_loss_fn(logits_raw, target)
+                
+                aug_data1, aug_data2 = aug_transformer(data), aug_transformer(data)
+                logits1, f1 = model(aug_data1)
+                logits2, f2 = model(aug_data2)
+                
+                with torch.no_grad():
+                    consistency = (logits1.argmax(dim=1) == logits2.argmax(dim=1)).float().mean().item()
+                    epoch_consistencies.append(consistency)
+                
+                gated_alignment = consistency * align_only_fn(f1, f2)
+                
+                etf_align = torch.tensor(0.0, device=device)
+                if use_drcl and fixed_anchors is not None:
+                    unique_classes = torch.unique(target)
+                    if len(unique_classes) > 0:
+                        proto_subset = model.learnable_proto[unique_classes]
+                        anchor_subset = fixed_anchors[unique_classes]
+                        etf_align = alignment_loss_fn(proto_subset, anchor_subset)
+                
+                base_loss = cls_loss
+                align_loss = gated_alignment + etf_align
+            elif use_raw_ce_au:
+                optimizer.zero_grad()
+
+                logits_raw, _ = model(data)
+                cls_loss = cls_loss_fn(logits_raw, target)
+
+                aug_data1, aug_data2 = aug_transformer(data), aug_transformer(data)
+                logits1, f1 = model(aug_data1)
+                logits2, f2 = model(aug_data2)
+
+                with torch.no_grad():
+                    probs1 = F.softmax(logits1, dim=1)
+                    probs2 = F.softmax(logits2, dim=1)
+                    consistency = (probs1 * probs2).sum(dim=1).mean().item()
+                    epoch_consistencies.append(consistency)
+
+                gate = consistency ** gate_power
+                au_loss = raw_ce_au_fn(f1, f2)
+
+                loss = cls_loss + lambda_align * gate * au_loss
+            elif use_raw_ce_supcon:
+                optimizer.zero_grad()
+
+                logits_raw, _ = model(data)
+                cls_loss = cls_loss_fn(logits_raw, target)
+
+                aug_data1, aug_data2 = aug_transformer(data), aug_transformer(data)
+                logits1, f1 = model(aug_data1)
+                logits2, f2 = model(aug_data2)
+
+                with torch.no_grad():
+                    probs1 = F.softmax(logits1, dim=1)
+                    probs2 = F.softmax(logits2, dim=1)
+                    consistency = (probs1 * probs2).sum(dim=1).mean().item()
+                    epoch_consistencies.append(consistency)
+
+                gate = consistency ** gate_power
+                features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+                supcon_loss = raw_ce_supcon_fn(features, target)
+
+                loss = cls_loss + lambda_align * gate * supcon_loss
+            elif use_raw_ce_flat_supcon:
+                # ── V24: CE on raw + flat SupCon (no gate) ──
+                optimizer.zero_grad()
+
+                logits_raw, _ = model(data)
+                cls_loss = cls_loss_fn(logits_raw, target)
+
+                aug_data1, aug_data2 = aug_transformer(data), aug_transformer(data)
+                _, f1 = model(aug_data1)
+                _, f2 = model(aug_data2)
+
+                features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+                supcon_loss = raw_ce_flat_supcon_fn(features, target)
+
+                loss = cls_loss + lambda_align * supcon_loss
             else:
                 # Full AURORA pipeline with augmented data
                 aug_data1, aug_data2 = aug_transformer(data), aug_transformer(data)
@@ -69,10 +170,6 @@ def ours_local_training(model, training_data, test_dataloader, start_epoch, loca
                 optimizer.zero_grad()
                 logits, feature_norm = model(aug_data)
 
-                # Augmentation Consistency Gating: measure whether two augmented
-                # views of the same image produce the same prediction.
-                # Cubed to sharply suppress alignment when consistency is low:
-                # cons=0.32 → 0.03 (near zero), cons=0.58 → 0.19, cons=0.8 → 0.51
                 if use_confidence_gating:
                     with torch.no_grad():
                         logits1, logits2 = torch.split(logits, [bsz, bsz], dim=0)
@@ -87,23 +184,29 @@ def ours_local_training(model, training_data, test_dataloader, start_epoch, loca
                 cls_loss = cls_loss_fn(logits, aug_labels)
 
                 f1, f2 = torch.split(feature_norm, [bsz, bsz], dim=0)
-                features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
-                contrastive_loss = contrastive_loss_fn(features, target)
-
-                unique_classes = torch.unique(target)
-                pro_feat_con_loss = con_proto_feat_loss_fn(feature_norm, model.learnable_proto, aug_labels, active_indices=unique_classes)
-                pro_con_loss = con_proto_loss_fn(model.learnable_proto, active_indices=unique_classes)
-
-                gated_contrastive = gate * contrastive_loss
-                gated_pro_feat = gate * pro_feat_con_loss
-                gated_pro_con = gate * pro_con_loss
-
-                if use_reclassified_losses:
+                
+                if use_align_uniform:
+                    align_uniform_loss = align_uniform_fn(f1, f2)
                     base_loss = cls_loss
-                    reg_loss = gated_contrastive + gated_pro_con + gated_pro_feat
+                    reg_loss = align_uniform_loss
                 else:
-                    base_loss = cls_loss + gated_contrastive + gated_pro_con + gated_pro_feat
-                    reg_loss = 0
+                    features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+                    contrastive_loss = contrastive_loss_fn(features, target)
+
+                    unique_classes = torch.unique(target)
+                    pro_feat_con_loss = con_proto_feat_loss_fn(feature_norm, model.learnable_proto, aug_labels, active_indices=unique_classes)
+                    pro_con_loss = con_proto_loss_fn(model.learnable_proto, active_indices=unique_classes)
+
+                    gated_contrastive = gate * contrastive_loss
+                    gated_pro_feat = gate * pro_feat_con_loss
+                    gated_pro_con = gate * pro_con_loss
+
+                    if use_reclassified_losses:
+                        base_loss = cls_loss
+                        reg_loss = gated_contrastive + gated_pro_con + gated_pro_feat
+                    else:
+                        base_loss = cls_loss + gated_contrastive + gated_pro_con + gated_pro_feat
+                        reg_loss = 0
 
                 align_loss = 0
 
@@ -128,44 +231,47 @@ def ours_local_training(model, training_data, test_dataloader, start_epoch, loca
                 if use_confidence_gating:
                     align_loss = gate * align_loss
 
-                if use_reclassified_losses:
+                if use_align_uniform:
+                    align_loss = 0.05 * reg_loss + align_loss
+                elif use_reclassified_losses:
                     align_loss = reg_loss + align_loss
 
-                if use_uncertainty_weighting:
-                    sigma_sq_local = torch.exp(model.log_sigma_sq_local)
-                    sigma_sq_align = torch.exp(model.log_sigma_sq_align)
+            if use_uncertainty_weighting and not in_warmup:
+                sigma_sq_local = torch.exp(model.log_sigma_sq_local)
+                sigma_sq_align = torch.exp(model.log_sigma_sq_align)
 
-                    if use_dynamic_task_attenuation:
-                        current_step = e
-                        progress = current_step / total_training_steps
-                        schedule_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
-                        schedule_factor = max(0.0, schedule_factor)
-                        lambda_eff_for_reg = sigma_sq_local / sigma_sq_align
-                        stability_reg = gamma_reg * torch.relu(lambda_eff_for_reg - lambda_max)
-                        loss_sigma_main = (0.5 / sigma_sq_local) * base_loss.detach() + \
-                                        (0.5 / sigma_sq_align) * align_loss.detach()
-                        effective_lambda = (sigma_sq_local / sigma_sq_align).detach()
-                        loss_for_weights = base_loss + effective_lambda * align_loss
-                    else:
-                        schedule_factor = 1.0
-                        stability_reg = 0
-                        loss_sigma_main = (0.5 / sigma_sq_local) * base_loss.detach() + \
-                                        (0.5 / sigma_sq_align) * align_loss.detach()
-                        effective_lambda = (sigma_sq_local / sigma_sq_align).detach()
-                        lambda_annealed = effective_lambda * annealing_factor
-                        loss_for_weights = base_loss + lambda_annealed * align_loss
-
-                    loss_for_sigma_total = loss_sigma_main + \
-                               0.5 * (torch.log(sigma_sq_local) + schedule_factor * torch.log(sigma_sq_align)) + \
-                               stability_reg
-                    loss = loss_for_weights + loss_for_sigma_total
-
-                elif use_drcl:
-                    global_progress = e / total_training_steps
-                    lambda_annealed = lambda_align * (1 - global_progress)
-                    loss = base_loss + lambda_annealed * align_loss
+                if use_dynamic_task_attenuation:
+                    current_step = e
+                    progress = current_step / total_training_steps
+                    schedule_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+                    schedule_factor = max(0.0, schedule_factor)
+                    lambda_eff_for_reg = sigma_sq_local / sigma_sq_align
+                    stability_reg = gamma_reg * torch.relu(lambda_eff_for_reg - lambda_max)
+                    loss_sigma_main = (0.5 / sigma_sq_local) * base_loss.detach() + \
+                                    (0.5 / sigma_sq_align) * align_loss.detach()
+                    effective_lambda = (sigma_sq_local / sigma_sq_align).detach()
+                    loss_for_weights = base_loss + effective_lambda * align_loss
                 else:
-                    loss = base_loss
+                    schedule_factor = 1.0
+                    stability_reg = 0
+                    loss_sigma_main = (0.5 / sigma_sq_local) * base_loss.detach() + \
+                                    (0.5 / sigma_sq_align) * align_loss.detach()
+                    effective_lambda = (sigma_sq_local / sigma_sq_align).detach()
+                    lambda_annealed = effective_lambda * annealing_factor
+                    loss_for_weights = base_loss + lambda_annealed * align_loss
+
+                loss_for_sigma_total = loss_sigma_main + \
+                           0.5 * (torch.log(sigma_sq_local) + schedule_factor * torch.log(sigma_sq_align)) + \
+                           stability_reg
+                loss = loss_for_weights + loss_for_sigma_total
+
+            elif use_drcl and not in_warmup and not use_align_only:
+                global_progress = e / total_training_steps
+                lambda_annealed = lambda_align * (1 - global_progress)
+                loss = base_loss + lambda_annealed * align_loss
+
+            elif use_align_only and not in_warmup:
+                loss = base_loss + lambda_align * align_loss
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -177,10 +283,21 @@ def ours_local_training(model, training_data, test_dataloader, start_epoch, loca
 
         phase_tag = " [WARMUP]" if in_warmup else ""
         consistency_info = ""
-        if use_confidence_gating and epoch_consistencies:
+        if (use_confidence_gating or use_align_only or use_raw_ce_au or use_raw_ce_supcon) and epoch_consistencies:
             avg_cons = sum(epoch_consistencies) / len(epoch_consistencies)
             consistency_info = f" [cons={avg_cons:.4f}]"
-        logger.info(f'Epoch {e}{phase_tag}{consistency_info} loss: {total_loss}; train accuracy: {train_set_acc}; test accuracy: {train_test_acc}')
+        au_info = ""
+        if use_align_uniform and not in_warmup:
+            au_info = " [AU]"
+        if use_align_only and not in_warmup:
+            au_info = " [Align-Only]"
+        if use_raw_ce_au and not in_warmup:
+            au_info = " [RawCE+AU]"
+        if use_raw_ce_supcon and not in_warmup:
+            au_info = " [RawCE+SupCon]"
+        if use_raw_ce_flat_supcon and not in_warmup:
+            au_info = " [RawCE+FlatSupCon]"
+        logger.info(f'Epoch {e}{phase_tag}{au_info}{consistency_info} loss: {total_loss}; train accuracy: {train_set_acc}; test accuracy: {train_test_acc}')
 
         if e % save_freq == 0:
             save_best_local_model(client_model_dir, model, f'epoch_{e}.pth', keep_only_last=True)

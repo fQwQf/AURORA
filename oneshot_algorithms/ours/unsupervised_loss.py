@@ -1,4 +1,44 @@
 import torch
+import torch.nn.functional as F
+
+
+class AlignmentLoss(torch.nn.Module):
+    """Alignment component from Wang & Isola (ICML 2020).
+    
+    Alignment-only loss: pushes positive pairs (two augmented views) together.
+    Unlike full Alignment+Uniformity, this is:
+    - Bounded (always >= 0 for L2-normalized features)
+    - Compatible with CE from epoch 0 (doesn't oppose class clustering)
+    - Naturally gated by augmentation quality (bad augmentation → noisy but bounded gradient)
+    
+    Collapse prevention is handled by ETF prototype alignment (pulling prototypes
+    toward maximally separated targets), NOT by uniformity on features.
+    """
+    def __init__(self, alpha=2):
+        super().__init__()
+        self.alpha = alpha
+    
+    def forward(self, x, y):
+        return (x - y).norm(dim=1).pow(self.alpha).mean()
+
+
+class AlignmentUniformityLoss(torch.nn.Module):
+    """Alignment + Uniformity on the Hypersphere (Wang & Isola, ICML 2020)."""
+    def __init__(self, alpha=2, t=2):
+        super().__init__()
+        self.alpha = alpha
+        self.t = t
+    
+    def forward(self, x, y):
+        align_loss = (x - y).norm(dim=1).pow(self.alpha).mean()
+        uniform_loss = 0.5 * (self._uniform(x, self.t) + self._uniform(y, self.t))
+        return align_loss + uniform_loss
+    
+    @staticmethod
+    def _uniform(x, t=2):
+        sq_pdist = torch.pdist(x, p=2).pow(2)
+        return sq_pdist.mul(-t).exp().mean().log()
+
 
 class SupConLoss(torch.nn.Module):
     """Supervised Contrastive Learning: https://arxiv.org/pdf/2004.11362.pdf.
