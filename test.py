@@ -65,7 +65,7 @@ elif config_args.algo == 'FedETF':
 # elif config_args.algo == 'OursV3':
 #     FedBCD3(trainset, test_loader, client_idx_map, config, global_model, device)
 elif config_args.algo == 'OursV4':
-    OneshotOurs(trainset, test_loader, client_idx_map, config, device)
+    OneshotOurs(trainset, test_loader, client_idx_map, config, device, lambda_val=config_args.lambdaval)
 elif config_args.algo == 'OursV5':
     OneshotOursV5(trainset, test_loader, client_idx_map, config, device)
 elif config_args.algo == 'OursV6':
@@ -124,8 +124,20 @@ elif config_args.algo == 'OursV23':
     OneshotOursV23(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
 elif config_args.algo == 'OursV24':
     OneshotOursV24(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
+elif config_args.algo == 'OursV25':
+    OneshotOursV25(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
+elif config_args.algo == 'Ablation_CEOnly':
+    OneshotAblationCEOnly(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
+elif config_args.algo == 'Ablation_SupConOnly':
+    OneshotAblationSupConOnly(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
+elif config_args.algo == 'Ablation_AugCEAugSupCon':
+    OneshotAblationAugCEAugSupCon(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
 elif config_args.algo == 'Ours_FeatureCollapse_Ablation':
     OneshotOurs_FeatureCollapse_Ablation(trainset, test_loader, client_idx_map, config, device, lambda_val=config_args.lambdaval)
+elif config_args.algo == 'OursV24FedAvg':
+    OneshotOursV24FedAvg(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
+elif config_args.algo == 'OursV24Projector':
+    OneshotOursV24Projector(trainset, test_loader, client_idx_map, config, device, gamma_reg=config_args.gamma_reg, lambda_max=config_args.lambda_max)
 else:
     raise NotImplementedError(f"Algorithm {config_args.algo} is not implemented.")   
 

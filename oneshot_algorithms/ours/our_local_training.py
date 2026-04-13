@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 
 
-def ours_local_training(model, training_data, test_dataloader, start_epoch, local_epochs, optim_name, lr, momentum, loss_name, device, num_classes, sample_per_class, aug_transformer, client_model_dir, total_rounds, save_freq=1, use_drcl=False, fixed_anchors=None, lambda_align=1.0, use_progressive_alignment=False, initial_protos=None, use_uncertainty_weighting=False, sigma_lr=None, annealing_factor=1.0, use_dynamic_task_attenuation=False, gamma_reg=0, lambda_max=50.0, force_feature_alignment=False, use_reclassified_losses=False, warmup_epochs=0, use_confidence_gating=False, use_align_uniform=False, use_align_only=False, use_raw_ce_au=False, use_raw_ce_supcon=False, use_raw_ce_flat_supcon=False, gate_power=2.0):
+def ours_local_training(model, training_data, test_dataloader, start_epoch, local_epochs, optim_name, lr, momentum, loss_name, device, num_classes, sample_per_class, aug_transformer, client_model_dir, total_rounds, save_freq=1, use_drcl=False, fixed_anchors=None, lambda_align=1.0, use_progressive_alignment=False, initial_protos=None, use_uncertainty_weighting=False, sigma_lr=None, annealing_factor=1.0, use_dynamic_task_attenuation=False, gamma_reg=0, lambda_max=50.0, force_feature_alignment=False, use_reclassified_losses=False, warmup_epochs=0, use_confidence_gating=False, use_align_uniform=False, use_align_only=False, use_raw_ce_au=False, use_raw_ce_supcon=False, use_raw_ce_flat_supcon=False, use_aug_ce_flat_supcon=False, use_ce_only_raw=False, use_supcon_only_aug=False, use_aug_ce_aug_supcon=False, use_fafi=False, gate_power=2.0):
     
     model.train()
     model.to(device)
@@ -55,9 +55,27 @@ def ours_local_training(model, training_data, test_dataloader, start_epoch, loca
         raw_ce_supcon_fn = SupConLoss(temperature=0.07)
         logger.info(f"V23 mode: CE on raw data + consistency^{gate_power}-gated SupCon on augmented views")
 
-    if use_raw_ce_flat_supcon:
+    if use_fafi:
+        logger.info("FAFI mode: L_ssl (SupCon) + L_proto (Prototype contrastive), NO CE, NO ETF align")
+    elif use_raw_ce_flat_supcon:
         raw_ce_flat_supcon_fn = SupConLoss(temperature=0.07)
         logger.info("V24 mode: CE on raw data + flat SupCon on augmented views (no gate)")
+
+    if use_aug_ce_flat_supcon:
+        aug_ce_flat_supcon_fn = SupConLoss(temperature=0.07)
+        logger.info("Ablation mode: CE on augmented + flat SupCon on augmented views")
+        logger.info("Ablation mode: CE on augmented data + flat SupCon on augmented views")
+
+    if use_ce_only_raw:
+        logger.info("Ablation mode: CE only on raw data")
+
+    if use_supcon_only_aug:
+        supcon_only_fn = SupConLoss(temperature=0.07)
+        logger.info("Ablation mode: SupCon only on augmented views")
+
+    if use_aug_ce_aug_supcon:
+        aug_ce_supcon_fn = SupConLoss(temperature=0.07)
+        logger.info("Ablation mode: CE on augmented + SupCon on augmented views (collapse test)")
 
     if use_drcl or use_progressive_alignment:
         alignment_loss_fn = torch.nn.MSELoss()
@@ -146,6 +164,29 @@ def ours_local_training(model, training_data, test_dataloader, start_epoch, loca
                 supcon_loss = raw_ce_supcon_fn(features, target)
 
                 loss = cls_loss + lambda_align * gate * supcon_loss
+            elif use_ce_only_raw:
+                # ── Ablation: CE only on raw data (no SupCon) ──
+                optimizer.zero_grad()
+                logits_raw, _ = model(data)
+                loss = cls_loss_fn(logits_raw, target)
+            elif use_supcon_only_aug:
+                # ── Ablation: SupCon only on augmented views (no CE) ──
+                optimizer.zero_grad()
+                aug_data1, aug_data2 = aug_transformer(data), aug_transformer(data)
+                _, f1 = model(aug_data1)
+                _, f2 = model(aug_data2)
+                features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+                loss = supcon_only_fn(features, target)
+            elif use_aug_ce_aug_supcon:
+                # ── Ablation: CE on augmented + SupCon on augmented (collapse test) ──
+                optimizer.zero_grad()
+                aug_data1, aug_data2 = aug_transformer(data), aug_transformer(data)
+                logits1, f1 = model(aug_data1)
+                logits2, f2 = model(aug_data2)
+                cls_loss = (cls_loss_fn(logits1, target) + cls_loss_fn(logits2, target)) / 2.0
+                features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+                supcon_loss = aug_ce_supcon_fn(features, target)
+                loss = cls_loss + lambda_align * supcon_loss
             elif use_raw_ce_flat_supcon:
                 # ── V24: CE on raw + flat SupCon (no gate) ──
                 optimizer.zero_grad()
@@ -161,6 +202,36 @@ def ours_local_training(model, training_data, test_dataloader, start_epoch, loca
                 supcon_loss = raw_ce_flat_supcon_fn(features, target)
 
                 loss = cls_loss + lambda_align * supcon_loss
+            elif use_aug_ce_flat_supcon:
+                # ── Ablation: CE on augmented + flat SupCon on augmented ──
+                optimizer.zero_grad()
+
+                aug_data1, aug_data2 = aug_transformer(data), aug_transformer(data)
+
+                logits1, f1 = model(aug_data1)
+                logits2, f2 = model(aug_data2)
+
+                # CE on both augmented views
+                cls_loss = (cls_loss_fn(logits1, target) + cls_loss_fn(logits2, target)) / 2.0
+
+                # SupCon on augmented view features
+                features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+                supcon_loss = aug_ce_flat_supcon_fn(features, target)
+
+                loss = cls_loss + lambda_align * supcon_loss
+            elif use_fafi:
+                optimizer.zero_grad()
+                aug_data1, aug_data2 = aug_transformer(data), aug_transformer(data)
+                _, f1 = model(aug_data1)
+                _, f2 = model(aug_data2)
+
+                features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+                ssl_loss = contrastive_loss_fn(features, target)
+
+                unique_classes = torch.unique(target)
+                proto_loss = con_proto_feat_loss_fn(f1, model.learnable_proto, target, active_indices=unique_classes)
+
+                loss = ssl_loss + proto_loss
             else:
                 # Full AURORA pipeline with augmented data
                 aug_data1, aug_data2 = aug_transformer(data), aug_transformer(data)
@@ -297,6 +368,16 @@ def ours_local_training(model, training_data, test_dataloader, start_epoch, loca
             au_info = " [RawCE+SupCon]"
         if use_raw_ce_flat_supcon and not in_warmup:
             au_info = " [RawCE+FlatSupCon]"
+        if use_aug_ce_flat_supcon and not in_warmup:
+            au_info = " [AugCE+FlatSupCon]"
+        if use_ce_only_raw and not in_warmup:
+            au_info = " [CE-only-raw]"
+        if use_supcon_only_aug and not in_warmup:
+            au_info = " [SupCon-only-aug]"
+        if use_aug_ce_aug_supcon and not in_warmup:
+            au_info = " [AugCE+AugSupCon]"
+        if use_fafi and not in_warmup:
+            au_info = " [FAFI-Lssl+Lproto]"
         logger.info(f'Epoch {e}{phase_tag}{au_info}{consistency_info} loss: {total_loss}; train accuracy: {train_set_acc}; test accuracy: {train_test_acc}')
 
         if e % save_freq == 0:

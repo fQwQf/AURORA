@@ -419,7 +419,7 @@ def eval_output_ensemble(model, test_loader, device):
     return acc
 
 
-def OneshotOurs(trainset, test_loader, client_idx_map, config, device, server_strategy='simple_feature'):
+def OneshotOurs(trainset, test_loader, client_idx_map, config, device, server_strategy='simple_feature', lambda_val=0):
     logger.info('OneshotOurs')
     
     use_imagenet_pretrain = config.get('DBCD', {}).get('use_imagenet_pretrain', False)
@@ -499,10 +499,11 @@ def OneshotOurs(trainset, test_loader, client_idx_map, config, device, server_st
                 aug_transformer=aug_transformer,
                 client_model_dir=local_model_dir + f"/client_{c}",
                 total_rounds=total_rounds,
-                save_freq=config['checkpoint']['save_freq'],
-                use_drcl=True,
-                fixed_anchors=fixed_anchors,
-                lambda_align=lambda_align_initial
+                 save_freq=config['checkpoint']['save_freq'],
+                 use_drcl=False,
+                 fixed_anchors=None,
+                 lambda_align=lambda_align_initial,
+                 use_fafi=True
             )
             
             local_models[c] = local_model_c
@@ -2794,6 +2795,300 @@ def OneshotOursV23(trainset, test_loader, client_idx_map, config, device, gamma_
         save_yaml_config(save_path + "/baselines_" + method_name +"_" + config['checkpoint']['result_file'], method_results)
 
 
+def OneshotAblationCEOnly(trainset, test_loader, client_idx_map, config, device, gamma_reg=1e-5, lambda_max=50.0, **kwargs):
+    """
+    Ablation: CE-only on raw data (no SupCon).
+    
+    Tests the classification baseline without any contrastive learning.
+    """
+    logger.info('OneshotAblationCEOnly: CE only on raw data (no SupCon)')
+    
+    use_pretrain_bool = config.get('DBCD', {}).get('use_pretrain', False)
+    use_imagenet_pretrain = config.get('DBCD', {}).get('use_imagenet_pretrain', False)
+    custom_pretrain_path = config.get('pretrain', {}).get('model_path', '')
+    dataset_name_lower = config['dataset']['data_name'].lower()
+    model_name = config['server']['model_name']
+    expected_custom_path = os.path.join(custom_pretrain_path, f"{dataset_name_lower}_{model_name}_centralized.pth")
+    
+    use_pretrain_arg = False
+    if use_pretrain_bool:
+        if os.path.exists(expected_custom_path):
+            use_pretrain_arg = expected_custom_path
+            logger.info(f"[OneshotAblationCEOnly] Custom weights at {expected_custom_path}")
+        else:
+            logger.warning(f"[OneshotAblationCEOnly] Custom weights NOT found. Random init.")
+    elif use_imagenet_pretrain:
+        use_pretrain_arg = True
+        logger.info("[OneshotAblationCEOnly] ImageNet pretrained weights.")
+
+    global_model = get_train_models(
+        model_name=config['server']['model_name'],
+        num_classes=config['dataset']['num_classes'],
+        mode='our',
+        use_pretrain=use_pretrain_arg,
+        in_channel=config['dataset'].get('channels', 3)
+    )
+    method_results = defaultdict(list)
+    save_path, local_model_dir = prepare_checkpoint_dir(config)
+    if not os.path.exists(save_path + "/config.yaml"):
+        save_yaml_config(save_path + "/config.yaml", config)
+    local_models = [copy.deepcopy(global_model) for _ in range(config['client']['num_clients'])]
+    local_data_size = [len(client_idx_map[c]) for c in range(config['client']['num_clients'])]
+    if config['server']['aggregated_by_datasize']:
+        weights = [i/sum(local_data_size) for i in local_data_size]
+    else:
+        weights = [1/config['client']['num_clients'] for _ in range(config['client']['num_clients'])]
+    aug_transformer = get_supcon_transform(config['dataset']['data_name'])
+    clients_sample_per_class = []
+    
+    total_rounds = config['server']['num_rounds']
+    local_epochs = config['server']['local_epochs']
+    logger.info(f'AblationCEOnly config: no lambda needed')
+
+    for cr in trange(total_rounds):
+        logger.info(f"Round {cr} starts--------| [AblationCEOnly: CE-only on raw data]")
+        local_protos = []
+        
+        for c in range(config['client']['num_clients']):
+            logger.info(f"Client {c} Starts Local Training--------|")
+            client_dataloader = get_client_dataloader(client_idx_map[c], trainset, config['dataset']['train_batch_size'])
+
+            if cr == 0:
+                clients_sample_per_class.append(generate_sample_per_class(config['dataset']['num_classes'], client_dataloader, len(client_idx_map[c])))
+
+            start_ep = cr * local_epochs
+            local_model_c = ours_local_training(
+                model=copy.deepcopy(local_models[c]),
+                training_data=client_dataloader,
+                test_dataloader=test_loader,
+                start_epoch=start_ep,
+                local_epochs=local_epochs,
+                optim_name=config['server']['optimizer'],
+                lr=config['server']['lr'],
+                momentum=config['server']['momentum'],
+                loss_name=config['server']['loss_name'],
+                device=device,
+                num_classes=config['dataset']['num_classes'],
+                sample_per_class=clients_sample_per_class[c],
+                aug_transformer=aug_transformer,
+                client_model_dir=local_model_dir + f"/client_{c}",
+                total_rounds=total_rounds,
+                warmup_epochs=0,
+                use_ce_only_raw=True
+            )
+            
+            local_models[c] = local_model_c
+            local_protos.append(local_model_c.get_proto().detach())
+
+        logger.info(f"Round {cr} Finish--------|")
+
+        method_name = 'Ablation_CE_Only_Raw'
+        ensemble_model = WEnsembleFeature(model_list=local_models, weight_list=weights)
+        global_proto = aggregate_local_protos(local_protos)
+        ens_acc = eval_with_proto(ensemble_model, test_loader, device, global_proto)
+        logger.info(f"The test accuracy of {method_name}: {ens_acc}")
+        method_results[method_name].append(ens_acc)
+        save_yaml_config(save_path + "/baselines_" + method_name +"_" + config['checkpoint']['result_file'], method_results)
+
+
+def OneshotAblationSupConOnly(trainset, test_loader, client_idx_map, config, device, gamma_reg=1e-5, lambda_max=50.0, **kwargs):
+    """
+    Ablation: SupCon-only on augmented views (no CE).
+    
+    Tests contrastive learning without classification supervision.
+    """
+    logger.info('OneshotAblationSupConOnly: SupCon only on augmented views (no CE)')
+    
+    use_pretrain_bool = config.get('DBCD', {}).get('use_pretrain', False)
+    use_imagenet_pretrain = config.get('DBCD', {}).get('use_imagenet_pretrain', False)
+    custom_pretrain_path = config.get('pretrain', {}).get('model_path', '')
+    dataset_name_lower = config['dataset']['data_name'].lower()
+    model_name = config['server']['model_name']
+    expected_custom_path = os.path.join(custom_pretrain_path, f"{dataset_name_lower}_{model_name}_centralized.pth")
+    
+    use_pretrain_arg = False
+    if use_pretrain_bool:
+        if os.path.exists(expected_custom_path):
+            use_pretrain_arg = expected_custom_path
+            logger.info(f"[OneshotAblationSupConOnly] Custom weights at {expected_custom_path}")
+        else:
+            logger.warning(f"[OneshotAblationSupConOnly] Custom weights NOT found. Random init.")
+    elif use_imagenet_pretrain:
+        use_pretrain_arg = True
+        logger.info("[OneshotAblationSupConOnly] ImageNet pretrained weights.")
+
+    global_model = get_train_models(
+        model_name=config['server']['model_name'],
+        num_classes=config['dataset']['num_classes'],
+        mode='our',
+        use_pretrain=use_pretrain_arg,
+        in_channel=config['dataset'].get('channels', 3)
+    )
+    method_results = defaultdict(list)
+    save_path, local_model_dir = prepare_checkpoint_dir(config)
+    if not os.path.exists(save_path + "/config.yaml"):
+        save_yaml_config(save_path + "/config.yaml", config)
+    local_models = [copy.deepcopy(global_model) for _ in range(config['client']['num_clients'])]
+    local_data_size = [len(client_idx_map[c]) for c in range(config['client']['num_clients'])]
+    if config['server']['aggregated_by_datasize']:
+        weights = [i/sum(local_data_size) for i in local_data_size]
+    else:
+        weights = [1/config['client']['num_clients'] for _ in range(config['client']['num_clients'])]
+    aug_transformer = get_supcon_transform(config['dataset']['data_name'])
+    clients_sample_per_class = []
+    
+    total_rounds = config['server']['num_rounds']
+    local_epochs = config['server']['local_epochs']
+    lambda_supcon = config.get('v24_config', {}).get('lambda', 1.0)
+    logger.info(f'AblationSupConOnly config: lambda_supcon={lambda_supcon}')
+
+    for cr in trange(total_rounds):
+        logger.info(f"Round {cr} starts--------| [AblationSupConOnly: SupCon-only on augmented, lambda={lambda_supcon}]")
+        local_protos = []
+        
+        for c in range(config['client']['num_clients']):
+            logger.info(f"Client {c} Starts Local Training--------|")
+            client_dataloader = get_client_dataloader(client_idx_map[c], trainset, config['dataset']['train_batch_size'])
+
+            if cr == 0:
+                clients_sample_per_class.append(generate_sample_per_class(config['dataset']['num_classes'], client_dataloader, len(client_idx_map[c])))
+
+            start_ep = cr * local_epochs
+            local_model_c = ours_local_training(
+                model=copy.deepcopy(local_models[c]),
+                training_data=client_dataloader,
+                test_dataloader=test_loader,
+                start_epoch=start_ep,
+                local_epochs=local_epochs,
+                optim_name=config['server']['optimizer'],
+                lr=config['server']['lr'],
+                momentum=config['server']['momentum'],
+                loss_name=config['server']['loss_name'],
+                device=device,
+                num_classes=config['dataset']['num_classes'],
+                sample_per_class=clients_sample_per_class[c],
+                aug_transformer=aug_transformer,
+                client_model_dir=local_model_dir + f"/client_{c}",
+                total_rounds=total_rounds,
+                lambda_align=lambda_supcon,
+                warmup_epochs=0,
+                use_supcon_only_aug=True
+            )
+            
+            local_models[c] = local_model_c
+            local_protos.append(local_model_c.get_proto().detach())
+
+        logger.info(f"Round {cr} Finish--------|")
+
+        method_name = 'Ablation_SupCon_Only_Aug'
+        ensemble_model = WEnsembleFeature(model_list=local_models, weight_list=weights)
+        global_proto = aggregate_local_protos(local_protos)
+        ens_acc = eval_with_proto(ensemble_model, test_loader, device, global_proto)
+        logger.info(f"The test accuracy of {method_name}: {ens_acc}")
+        method_results[method_name].append(ens_acc)
+        save_yaml_config(save_path + "/baselines_" + method_name +"_" + config['checkpoint']['result_file'], method_results)
+
+
+def OneshotAblationAugCEAugSupCon(trainset, test_loader, client_idx_map, config, device, gamma_reg=1e-5, lambda_max=50.0, **kwargs):
+    """
+    Ablation: CE on augmented + SupCon on augmented (collapse test).
+    
+    Tests the scenario where both CE and SupCon operate on augmented views.
+    This is the "collapse" experiment - if augmentation is too destructive,
+    both CE and SupCon suffer from degraded inputs.
+    """
+    logger.info('OneshotAblationAugCEAugSupCon: CE on augmented + SupCon on augmented (collapse test)')
+    
+    use_pretrain_bool = config.get('DBCD', {}).get('use_pretrain', False)
+    use_imagenet_pretrain = config.get('DBCD', {}).get('use_imagenet_pretrain', False)
+    custom_pretrain_path = config.get('pretrain', {}).get('model_path', '')
+    dataset_name_lower = config['dataset']['data_name'].lower()
+    model_name = config['server']['model_name']
+    expected_custom_path = os.path.join(custom_pretrain_path, f"{dataset_name_lower}_{model_name}_centralized.pth")
+    
+    use_pretrain_arg = False
+    if use_pretrain_bool:
+        if os.path.exists(expected_custom_path):
+            use_pretrain_arg = expected_custom_path
+            logger.info(f"[OneshotAblationAugCEAugSupCon] Custom weights at {expected_custom_path}")
+        else:
+            logger.warning(f"[OneshotAblationAugCEAugSupCon] Custom weights NOT found. Random init.")
+    elif use_imagenet_pretrain:
+        use_pretrain_arg = True
+        logger.info("[OneshotAblationAugCEAugSupCon] ImageNet pretrained weights.")
+
+    global_model = get_train_models(
+        model_name=config['server']['model_name'],
+        num_classes=config['dataset']['num_classes'],
+        mode='our',
+        use_pretrain=use_pretrain_arg,
+        in_channel=config['dataset'].get('channels', 3)
+    )
+    method_results = defaultdict(list)
+    save_path, local_model_dir = prepare_checkpoint_dir(config)
+    if not os.path.exists(save_path + "/config.yaml"):
+        save_yaml_config(save_path + "/config.yaml", config)
+    local_models = [copy.deepcopy(global_model) for _ in range(config['client']['num_clients'])]
+    local_data_size = [len(client_idx_map[c]) for c in range(config['client']['num_clients'])]
+    if config['server']['aggregated_by_datasize']:
+        weights = [i/sum(local_data_size) for i in local_data_size]
+    else:
+        weights = [1/config['client']['num_clients'] for _ in range(config['client']['num_clients'])]
+    aug_transformer = get_supcon_transform(config['dataset']['data_name'])
+    clients_sample_per_class = []
+    
+    total_rounds = config['server']['num_rounds']
+    local_epochs = config['server']['local_epochs']
+    lambda_supcon = config.get('v24_config', {}).get('lambda', 1.0)
+    logger.info(f'AblationAugCEAugSupCon config: lambda_supcon={lambda_supcon}')
+
+    for cr in trange(total_rounds):
+        logger.info(f"Round {cr} starts--------| [AblationAugCEAugSupCon: CE+SupCon on augmented, lambda={lambda_supcon}]")
+        local_protos = []
+        
+        for c in range(config['client']['num_clients']):
+            logger.info(f"Client {c} Starts Local Training--------|")
+            client_dataloader = get_client_dataloader(client_idx_map[c], trainset, config['dataset']['train_batch_size'])
+
+            if cr == 0:
+                clients_sample_per_class.append(generate_sample_per_class(config['dataset']['num_classes'], client_dataloader, len(client_idx_map[c])))
+
+            start_ep = cr * local_epochs
+            local_model_c = ours_local_training(
+                model=copy.deepcopy(local_models[c]),
+                training_data=client_dataloader,
+                test_dataloader=test_loader,
+                start_epoch=start_ep,
+                local_epochs=local_epochs,
+                optim_name=config['server']['optimizer'],
+                lr=config['server']['lr'],
+                momentum=config['server']['momentum'],
+                loss_name=config['server']['loss_name'],
+                device=device,
+                num_classes=config['dataset']['num_classes'],
+                sample_per_class=clients_sample_per_class[c],
+                aug_transformer=aug_transformer,
+                client_model_dir=local_model_dir + f"/client_{c}",
+                total_rounds=total_rounds,
+                lambda_align=lambda_supcon,
+                warmup_epochs=0,
+                use_aug_ce_aug_supcon=True
+            )
+            
+            local_models[c] = local_model_c
+            local_protos.append(local_model_c.get_proto().detach())
+
+        logger.info(f"Round {cr} Finish--------|")
+
+        method_name = 'Ablation_AugCE_AugSupCon'
+        ensemble_model = WEnsembleFeature(model_list=local_models, weight_list=weights)
+        global_proto = aggregate_local_protos(local_protos)
+        ens_acc = eval_with_proto(ensemble_model, test_loader, device, global_proto)
+        logger.info(f"The test accuracy of {method_name}: {ens_acc}")
+        method_results[method_name].append(ens_acc)
+        save_yaml_config(save_path + "/baselines_" + method_name +"_" + config['checkpoint']['result_file'], method_results)
+
+
 def OneshotOursV24(trainset, test_loader, client_idx_map, config, device, gamma_reg, lambda_max=50.0, **kwargs):
     """
     AURORA V24: Raw-Data CE + Flat SupCon (No Gate).
@@ -3318,6 +3613,196 @@ def OneshotOursV20(trainset, test_loader, client_idx_map, config, device, gamma_
         global_proto = aggregate_local_protos(local_protos)
         ens_acc = eval_with_proto(ensemble_model, test_loader, device, global_proto)
         
+        logger.info(f"The test accuracy of {method_name}: {ens_acc}")
+        method_results[method_name].append(ens_acc)
+        save_yaml_config(save_path + "/baselines_" + method_name +"_" + config['checkpoint']['result_file'], method_results)
+
+
+def OneshotOursV24FedAvg(trainset, test_loader, client_idx_map, config, device, gamma_reg=1e-5, lambda_max=50.0, **kwargs):
+    logger.info('OneshotOursV24FedAvg: V24 RawCE + Flat SupCon + FedAvg Parameter Averaging')
+    
+    use_pretrain_bool = config.get('DBCD', {}).get('use_pretrain', False)
+    use_imagenet_pretrain = config.get('DBCD', {}).get('use_imagenet_pretrain', False)
+    custom_pretrain_path = config.get('pretrain', {}).get('model_path', '')
+    dataset_name_lower = config['dataset']['data_name'].lower()
+    model_name = config['server']['model_name']
+    expected_custom_path = os.path.join(custom_pretrain_path, f"{dataset_name_lower}_{model_name}_centralized.pth")
+    
+    use_pretrain_arg = False
+    if use_pretrain_bool:
+        if os.path.exists(expected_custom_path):
+            use_pretrain_arg = expected_custom_path
+            logger.info(f"[OneshotOursV24FedAvg] Custom weights at {expected_custom_path}")
+        else:
+            logger.warning(f"[OneshotOursV24FedAvg] Custom weights NOT found. Random init.")
+    elif use_imagenet_pretrain:
+        use_pretrain_arg = True
+        logger.info("[OneshotOursV24FedAvg] ImageNet pretrained weights.")
+
+    global_model = get_train_models(
+        model_name=config['server']['model_name'],
+        num_classes=config['dataset']['num_classes'],
+        mode='our',
+        use_pretrain=use_pretrain_arg,
+        in_channel=config['dataset'].get('channels', 3)
+    )
+    method_results = defaultdict(list)
+    save_path, local_model_dir = prepare_checkpoint_dir(config)
+    if not os.path.exists(save_path + "/config.yaml"):
+        save_yaml_config(save_path + "/config.yaml", config)
+    local_models = [copy.deepcopy(global_model) for _ in range(config['client']['num_clients'])]
+    local_data_size = [len(client_idx_map[c]) for c in range(config['client']['num_clients'])]
+    if config['server']['aggregated_by_datasize']:
+        weights = [i/sum(local_data_size) for i in local_data_size]
+    else:
+        weights = [1/config['client']['num_clients'] for _ in range(config['client']['num_clients'])]
+    aug_transformer = get_supcon_transform(config['dataset']['data_name'])
+    clients_sample_per_class = []
+    
+    total_rounds = config['server']['num_rounds']
+    local_epochs = config['server']['local_epochs']
+    lambda_supcon = config.get('v24_config', {}).get('lambda', 1.0)
+    logger.info(f'V24FedAvg config: lambda_supcon={lambda_supcon}')
+
+    for cr in trange(total_rounds):
+        logger.info(f"Round {cr} starts--------| [V24FedAvg: RawCE + flat SupCon + FedAvg, lambda={lambda_supcon}]")
+        
+        for c in range(config['client']['num_clients']):
+            logger.info(f"Client {c} Starts Local Training--------|")
+            client_dataloader = get_client_dataloader(client_idx_map[c], trainset, config['dataset']['train_batch_size'])
+
+            if cr == 0:
+                clients_sample_per_class.append(generate_sample_per_class(config['dataset']['num_classes'], client_dataloader, len(client_idx_map[c])))
+
+            start_ep = cr * local_epochs
+            local_model_c = ours_local_training(
+                model=copy.deepcopy(local_models[c]),
+                training_data=client_dataloader,
+                test_dataloader=test_loader,
+                start_epoch=start_ep,
+                local_epochs=local_epochs,
+                optim_name=config['server']['optimizer'],
+                lr=config['server']['lr'],
+                momentum=config['server']['momentum'],
+                loss_name=config['server']['loss_name'],
+                device=device,
+                num_classes=config['dataset']['num_classes'],
+                sample_per_class=clients_sample_per_class[c],
+                aug_transformer=aug_transformer,
+                client_model_dir=local_model_dir + f"/client_{c}",
+                total_rounds=total_rounds,
+                lambda_align=lambda_supcon,
+                warmup_epochs=0,
+                use_raw_ce_flat_supcon=True
+            )
+            
+            local_models[c] = local_model_c
+
+        logger.info(f"Round {cr} Finish--------|")
+        
+        method_name = 'OursV24FedAvg'
+        aggregated_model = parameter_averaging(local_models, weights)
+        acc = test_acc_our_model(aggregated_model, test_loader, device)
+        logger.info(f"The test accuracy of {method_name}: {acc}")
+        method_results[method_name].append(acc)
+        
+        local_models = [copy.deepcopy(aggregated_model) for _ in range(config['client']['num_clients'])]
+
+        save_yaml_config(save_path + "/baselines_" + method_name +"_" + config['checkpoint']['result_file'], method_results)
+
+
+def OneshotOursV24Projector(trainset, test_loader, client_idx_map, config, device, gamma_reg=1e-5, lambda_max=50.0, **kwargs):
+    logger.info('OneshotOursV24Projector: V24 RawCE + Flat SupCon + Projector Head')
+    
+    use_pretrain_bool = config.get('DBCD', {}).get('use_pretrain', False)
+    use_imagenet_pretrain = config.get('DBCD', {}).get('use_imagenet_pretrain', False)
+    custom_pretrain_path = config.get('pretrain', {}).get('model_path', '')
+    dataset_name_lower = config['dataset']['data_name'].lower()
+    model_name = config['server']['model_name']
+    expected_custom_path = os.path.join(custom_pretrain_path, f"{dataset_name_lower}_{model_name}_centralized.pth")
+    
+    use_pretrain_arg = False
+    if use_pretrain_bool:
+        if os.path.exists(expected_custom_path):
+            use_pretrain_arg = expected_custom_path
+            logger.info(f"[OneshotOursV24Projector] Custom weights at {expected_custom_path}")
+        else:
+            logger.warning(f"[OneshotOursV24Projector] Custom weights NOT found. Random init.")
+    elif use_imagenet_pretrain:
+        use_pretrain_arg = True
+        logger.info("[OneshotOursV24Projector] ImageNet pretrained weights.")
+
+    global_model = get_train_models(
+        model_name=config['server']['model_name'],
+        num_classes=config['dataset']['num_classes'],
+        mode='our_projector',
+        use_pretrain=use_pretrain_arg,
+        in_channel=config['dataset'].get('channels', 3)
+    )
+    
+    feature_dim = global_model.learnable_proto.shape[1]
+    logger.info(f"Initialized V24Projector with Projector. Feature Dim: {feature_dim}")
+    
+    method_results = defaultdict(list)
+    save_path, local_model_dir = prepare_checkpoint_dir(config)
+    if not os.path.exists(save_path + "/config.yaml"):
+        save_yaml_config(save_path + "/config.yaml", config)
+    local_models = [copy.deepcopy(global_model) for _ in range(config['client']['num_clients'])]
+    local_data_size = [len(client_idx_map[c]) for c in range(config['client']['num_clients'])]
+    if config['server']['aggregated_by_datasize']:
+        weights = [i/sum(local_data_size) for i in local_data_size]
+    else:
+        weights = [1/config['client']['num_clients'] for _ in range(config['client']['num_clients'])]
+    aug_transformer = get_supcon_transform(config['dataset']['data_name'])
+    clients_sample_per_class = []
+    
+    total_rounds = config['server']['num_rounds']
+    local_epochs = config['server']['local_epochs']
+    lambda_supcon = config.get('v24_config', {}).get('lambda', 1.0)
+    logger.info(f'V24Projector config: lambda_supcon={lambda_supcon}')
+
+    for cr in trange(total_rounds):
+        logger.info(f"Round {cr} starts--------| [V24Projector: RawCE + flat SupCon + Projector, lambda={lambda_supcon}]")
+        local_protos = []
+        
+        for c in range(config['client']['num_clients']):
+            logger.info(f"Client {c} Starts Local Training--------|")
+            client_dataloader = get_client_dataloader(client_idx_map[c], trainset, config['dataset']['train_batch_size'])
+
+            if cr == 0:
+                clients_sample_per_class.append(generate_sample_per_class(config['dataset']['num_classes'], client_dataloader, len(client_idx_map[c])))
+
+            start_ep = cr * local_epochs
+            local_model_c = ours_local_training(
+                model=copy.deepcopy(local_models[c]),
+                training_data=client_dataloader,
+                test_dataloader=test_loader,
+                start_epoch=start_ep,
+                local_epochs=local_epochs,
+                optim_name=config['server']['optimizer'],
+                lr=config['server']['lr'],
+                momentum=config['server']['momentum'],
+                loss_name=config['server']['loss_name'],
+                device=device,
+                num_classes=config['dataset']['num_classes'],
+                sample_per_class=clients_sample_per_class[c],
+                aug_transformer=aug_transformer,
+                client_model_dir=local_model_dir + f"/client_{c}",
+                total_rounds=total_rounds,
+                lambda_align=lambda_supcon,
+                warmup_epochs=0,
+                use_raw_ce_flat_supcon=True
+            )
+            
+            local_models[c] = local_model_c
+            local_protos.append(local_model_c.get_proto().detach())
+
+        logger.info(f"Round {cr} Finish--------|")
+
+        method_name = 'OursV24Projector'
+        ensemble_model = WEnsembleFeature(model_list=local_models, weight_list=weights)
+        global_proto = aggregate_local_protos(local_protos)
+        ens_acc = eval_with_proto(ensemble_model, test_loader, device, global_proto)
         logger.info(f"The test accuracy of {method_name}: {ens_acc}")
         method_results[method_name].append(ens_acc)
         save_yaml_config(save_path + "/baselines_" + method_name +"_" + config['checkpoint']['result_file'], method_results)
