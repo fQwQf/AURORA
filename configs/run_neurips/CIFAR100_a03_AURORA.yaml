@@ -1,0 +1,79 @@
+exp_name: "CIFAR100_a03_AURORA"
+dataset:
+  data_name: "CIFAR100"
+  root_path: '/data1/tongjizhou/FAFI_ICML25/data/'
+  train_batch_size: 256
+  test_batch_size: 256
+  channels: 3
+  num_classes: 100
+  image_size: 32
+
+distribution:
+  type: "dirichlet"
+  label_num_per_client: 2
+  alpha: 0.3
+
+client:
+  num_clients: 5
+
+server:
+  num_rounds: 20
+  frac_clients: 1.0
+  lr: 0.05
+  local_epochs: 10
+  optimizer: "sgd"
+  momentum: 0.9
+  weight_decay: 0.0001
+  loss_name: "ce"
+  model_name: "resnet18"
+  aggregated_by_datasize: True
+  lr_decay_per_round: 0.998
+
+device: "cuda:0"
+
+checkpoint:
+  save_path: "./checkpoints/neurips_cifar100_a03/"
+  save_freq: 100
+  result_file: "cifar100_results.yaml"
+
+pretrain:
+  lr: 0.01
+  epoch: 70
+  model_path: "./pretrain/"
+  momentum: 0.9
+  weight_decay: 0.0001
+  model_name: "resnet18"
+  model_file_name: "resnet18-f37072fd.pth"
+
+DBCD:
+  alpha_l_pa: 1
+  alpha_l_pb: 1
+  alpha_l_pc: 0.0
+  Beta_alpha: 0.2
+  unsup_method: 'infonce'
+  contrastive_temperature: 0.5
+  encoder_epoch: 40
+  projector_epoch: 10
+  use_pretrain: False
+  aug_batch_size: 256
+  encoder_lr: 0.03
+  cls_optimizer: 'sgd'
+  cls_lr: 0.05
+  supcon_temp: 0.07
+  super_gr: 100
+  aux_with_public: True
+
+etf:
+  loss_name: "ce"
+
+visualization:
+  interval: 5
+  save_path: 'visualization/resnet18'
+  vis_size: 16
+resume: False
+resume_best: False
+seed: 42
+
+lambda_align_initial: 20.0
+v24_config:
+  lambda: 1.0

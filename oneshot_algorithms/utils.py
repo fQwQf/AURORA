@@ -178,7 +178,7 @@ def test_acc(model, testloader, device='cpu', mode='normal'):
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
 
-    acc = correct / total
+    acc = correct / total if total > 0 else 0.0
     return acc
 
 # local training functions

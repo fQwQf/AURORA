@@ -1652,6 +1652,7 @@ def OneshotFAFIFedAvg(trainset, test_loader, client_idx_map, config, device, lam
                 total_rounds=total_rounds,
                 save_freq=config['checkpoint']['save_freq'],
                 # Removed V7 params: use_drcl, fixed_anchors, lambda_align
+                use_fafi=True
             )
             
             local_models[c] = local_model_c
@@ -3191,6 +3192,7 @@ def OneshotOursV24(trainset, test_loader, client_idx_map, config, device, gamma_
         logger.info(f"The test accuracy of {method_name}: {ens_acc}")
         method_results[method_name].append(ens_acc)
         save_yaml_config(save_path + "/baselines_" + method_name +"_" + config['checkpoint']['result_file'], method_results)
+    return  # V24 only — V21 removed to avoid running twice
     """
     AURORA V21: Consistency-Gated Alignment-Only (No Warmup, No Uniformity).
     
